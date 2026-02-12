@@ -1,4 +1,13 @@
-// server.js
+// server.js (Improved relevance + safer Top 3)
+// - Default "Any": Google Shopping only
+// - store=eBay: eBay only (NEW only by default)
+// - Adds relevance scoring (match score -> then price)
+// - Adds category-aware junk filtering (footwear/clothing)
+// - Keeps store name filtering for Google sources
+//
+// NOTE: Replace entire file with this. Keep your Render env vars:
+// SERPAPI_KEY, EBAY_CLIENT_ID, EBAY_CLIENT_SECRET
+
 import express from "express";
 
 const app = express();
@@ -53,6 +62,131 @@ async function getEbayAppToken() {
 }
 
 // --------------------
+// Query intent + scoring
+// --------------------
+const STOPWORDS = new Set([
+  "the","a","an","and","or","for","with","without","to","of","in","on","at","by",
+  "new","brand","original","genuine","authentic",
+  "size","uk","us","eu","mens","men","men's","womens","women","women's","kids","kid","child","children",
+  "pack","set","bundle"
+]);
+
+function normalizeText(s) {
+  return (s || "")
+    .toString()
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function tokenizeQuery(q) {
+  const norm = normalizeText(q);
+  const raw = norm.split(" ").filter(Boolean);
+  // Keep numbers (like 95, 270, etc.) and important brand/model words
+  const tokens = raw.filter(t => t.length >= 2 && !STOPWORDS.has(t));
+  // De-duplicate
+  return Array.from(new Set(tokens));
+}
+
+function looksLikeFootwear(q) {
+  const s = normalizeText(q);
+  const keys = ["shoe","shoes","trainer","trainers","sneaker","sneakers","boot","boots","football","cleats"];
+  return keys.some(k => s.includes(k)) || /\bair\s?max\b/.test(s);
+}
+
+function looksLikeClothing(q) {
+  const s = normalizeText(q);
+  const keys = ["hoodie","tshirt","t-shirt","tee","shirt","polo","jacket","coat","jumper","sweater","tracksuit","jeans","trousers","pants","shorts","leggings","dress","skirt","top"];
+  return keys.some(k => s.includes(k));
+}
+
+function getIntent(q) {
+  if (looksLikeFootwear(q)) return "footwear";
+  if (looksLikeClothing(q)) return "clothing";
+  return "general";
+}
+
+// Category-aware negative keywords (prevents cheap accessories hijacking Top 3)
+const NEGATIVE_COMMON = [
+  "phone case","case for","cover","screen protector","tempered glass","camera lens",
+  "sticker","skin","strap","lanyard","keychain","key ring","holder","stand"
+];
+
+const NEGATIVE_FOOTWEAR = [
+  "laces","lace","insole","insoles","shoe cleaner","cleaner","protector spray","spray",
+  "sock","socks","shoe bag","bag","replacement","repair","kit","insert"
+];
+
+const NEGATIVE_CLOTHING = [
+  "hanger","washing","laundry","detergent","patch","iron on","button","zipper","zip","thread"
+];
+
+function containsNegative(title, list) {
+  const t = normalizeText(title);
+  return list.some(neg => t.includes(neg));
+}
+
+function passesNegativeFilter(item, intent) {
+  const title = item.title || "";
+  if (containsNegative(title, NEGATIVE_COMMON)) return false;
+  if (intent === "footwear" && containsNegative(title, NEGATIVE_FOOTWEAR)) return false;
+  if (intent === "clothing" && containsNegative(title, NEGATIVE_CLOTHING)) return false;
+  return true;
+}
+
+// Relevance scoring: score by query token matches + phrase bonuses
+function scoreItem(itemTitle, query, tokens) {
+  const title = normalizeText(itemTitle);
+  if (!title) return 0;
+
+  let score = 0;
+
+  // Token matches
+  for (const tok of tokens) {
+    if (title.includes(tok)) score += 2;
+  }
+
+  // Phrase bonuses for common patterns
+  const qNorm = normalizeText(query);
+
+  // Bonus if title contains "air max" when query includes it
+  if (qNorm.includes("air max") && title.includes("air max")) score += 6;
+
+  // Bonus if query contains a number model (e.g. 95, 270) and title contains it
+  const nums = qNorm.match(/\b\d{2,4}\b/g) || [];
+  for (const n of nums) {
+    if (title.includes(n)) score += 4;
+  }
+
+  // Penalty if title contains "women" or "kids" when query seems men-focused (light touch)
+  if (qNorm.includes("men") || qNorm.includes("mens") || qNorm.includes("men's")) {
+    if (title.includes("women") || title.includes("womens") || title.includes("kid") || title.includes("kids")) score -= 4;
+  }
+
+  // Slight penalty for suspiciously generic titles
+  if (title.length < 12) score -= 2;
+
+  return score;
+}
+
+// Rank: score desc, then price asc
+function rankAndPickTop3(items, query) {
+  const tokens = tokenizeQuery(query);
+  return items
+    .map(it => ({
+      ...it,
+      _score: scoreItem(it.title, query, tokens)
+    }))
+    .sort((a, b) => {
+      if (b._score !== a._score) return b._score - a._score;
+      return a.price - b.price;
+    })
+    .slice(0, 3)
+    .map(({ _score, ...rest }) => rest);
+}
+
+// --------------------
 // SerpApi: Google Shopping
 // --------------------
 async function fetchGoogleShopping(q, country) {
@@ -79,12 +213,15 @@ async function fetchGoogleShopping(q, country) {
       const price = Number(it.extracted_price);
       if (!Number.isFinite(price)) return null;
 
+      // Prefer a "product_link" if present, otherwise fallback.
+      const link = it.product_link || it.link || "";
+
       return {
         title: it.title || "Item",
         store: it.source || "Google Shopping",
         price,
         currency: "GBP",
-        url: it.link || it.product_link || "",
+        url: link,
         source: "google",
       };
     })
@@ -94,8 +231,7 @@ async function fetchGoogleShopping(q, country) {
 
 // --------------------
 // eBay Browse API (ONLY used when store=eBay)
-// Default: NEW items only
-// Optional: allow condition=used to show used items when user explicitly asks
+// Default: NEW items only unless condition=used
 // --------------------
 async function fetchEbay(q, country, condition = "new") {
   const token = await getEbayAppToken();
@@ -105,7 +241,7 @@ async function fetchEbay(q, country, condition = "new") {
 
   const url = new URL("https://api.ebay.com/buy/browse/v1/item_summary/search");
   url.searchParams.set("q", q);
-  url.searchParams.set("limit", "30");
+  url.searchParams.set("limit", "40");
   url.searchParams.set("sort", "price");
 
   const r = await fetch(url, {
@@ -128,7 +264,6 @@ async function fetchEbay(q, country, condition = "new") {
       if (!Number.isFinite(priceVal)) return null;
 
       const link = it.itemAffiliateWebUrl || it.itemWebUrl || "";
-
       return {
         title: it.title || "Item",
         store: "eBay",
@@ -142,60 +277,14 @@ async function fetchEbay(q, country, condition = "new") {
     .filter(Boolean)
     .filter((x) => x.url);
 
-  // Default: NEW only (unless condition=used explicitly)
   const cond = (condition || "new").toLowerCase();
   if (cond === "new") {
     items = items.filter((x) => (x.condition || "").toLowerCase() === "new");
   } else if (cond === "used") {
     items = items.filter((x) => (x.condition || "").toLowerCase().includes("used"));
   }
-  // else: if condition is unknown, leave items as-is (but you can restrict if you prefer)
 
   return items;
-}
-
-// --------------------
-// Optional: light “junk” filter (prevents ultra-cheap accessories hijacking results)
-// Applied to Google results (since eBay is opt-in now)
-// --------------------
-function looksLikeFootwearOrClothing(q) {
-  const s = q.toLowerCase();
-  const keywords = [
-    "shoe",
-    "shoes",
-    "trainer",
-    "trainers",
-    "sneaker",
-    "sneakers",
-    "air max",
-    "nike",
-    "adidas",
-    "puma",
-    "jordans",
-    "hoodie",
-    "t-shirt",
-    "jeans",
-    "jacket",
-  ];
-  return keywords.some((k) => s.includes(k));
-}
-
-function filterJunkForFashion(items) {
-  const banned = [
-    "phone case",
-    "case for",
-    "iphone case",
-    "iphone",
-    "samsung case",
-    "cover",
-    "screen protector",
-    "tempered glass",
-    "camera lens protector",
-  ];
-  return items.filter((x) => {
-    const t = (x.title || "").toLowerCase();
-    return !banned.some((b) => t.includes(b));
-  });
 }
 
 // --------------------
@@ -208,10 +297,11 @@ app.get("/", (_req, res) => {
 /**
  * GET /search?q=...&country=GB&store=Any|Nike|JD|...|eBay&condition=new|used
  *
- * IMPORTANT BEHAVIOUR (as requested):
- * - Default ("Any"): Google Shopping only (no eBay mixed in)
- * - store=eBay: eBay results only
- * - eBay default condition = new (no used unless explicitly requested)
+ * Improved behavior:
+ * - Default "Any": Google Shopping only, ranked by relevance then price.
+ * - store=eBay: eBay only, ranked by relevance then price, NEW only by default.
+ * - store=Other: filters Google results by store name then ranks.
+ * - Category-aware negative filters reduce irrelevant accessories.
  */
 app.get("/search", async (req, res) => {
   try {
@@ -222,30 +312,33 @@ app.get("/search", async (req, res) => {
 
     if (!q) return res.status(400).json({ error: "Missing q" });
 
-    // If user explicitly selected eBay, return ONLY eBay results (NEW by default)
+    const intent = getIntent(q);
+
+    // eBay only (opt-in)
     if (store.toLowerCase() === "ebay") {
-      const ebayItems = await fetchEbay(q, country, condition).catch(() => []);
-      const top = ebayItems.sort((a, b) => a.price - b.price).slice(0, 3);
-      return res.json({ query: q, store, condition, results: top });
+      const ebayItemsRaw = await fetchEbay(q, country, condition).catch(() => []);
+      const ebayItems = ebayItemsRaw.filter(it => passesNegativeFilter(it, intent));
+      const top = rankAndPickTop3(ebayItems, q);
+      return res.json({ query: q, store, condition, intent, results: top });
     }
 
-    // Default: Google Shopping only
+    // Google Shopping only by default
     let googleItems = await fetchGoogleShopping(q, country).catch(() => []);
 
-    // Optional “junk” filtering for fashion-ish queries
-    if (looksLikeFootwearOrClothing(q)) {
-      googleItems = filterJunkForFashion(googleItems);
-    }
+    // Category-aware junk filtering
+    googleItems = googleItems.filter(it => passesNegativeFilter(it, intent));
 
-    // Optional store filter by store name (works for Google sources)
+    // Optional store-name filtering for Google results
     let filtered = googleItems;
     if (store && store.toLowerCase() !== "any") {
       const s = store.toLowerCase();
       filtered = filtered.filter((x) => (x.store || "").toLowerCase().includes(s));
     }
 
-    const top3 = filtered.sort((a, b) => a.price - b.price).slice(0, 3);
-    res.json({ query: q, store, results: top3 });
+    // Rank by relevance then price
+    const top3 = rankAndPickTop3(filtered, q);
+
+    res.json({ query: q, store, intent, results: top3 });
   } catch (e) {
     res.status(500).json({ error: "Server error", detail: String(e) });
   }
