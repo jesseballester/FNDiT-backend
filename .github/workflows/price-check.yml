@@ -2,80 +2,54 @@ name: FNDiT Daily Price Check
 
 on:
   schedule:
-    - cron: "5 7 * * *"   # daily 07:05 UTC
+    - cron: "5 7 * * *"
   workflow_dispatch: {}
 
 jobs:
   run-price-check:
     runs-on: ubuntu-latest
+
     steps:
       - name: Call FNDiT price checker
+        id: call
         env:
           PRICE_CHECK_URL: ${{ secrets.PRICE_CHECK_URL }}
           CHECK_SECRET: ${{ secrets.CHECK_SECRET }}
         run: |
           echo "Calling price checker..."
-          curl -sS -f "${PRICE_CHECK_URL}?secret=${CHECK_SECRET}" | tee response.json
-          echo "Done."
+          RESPONSE=$(curl -sS -f "${PRICE_CHECK_URL}?secret=${CHECK_SECRET}")
+          echo "$RESPONSE"
+          echo "response=$RESPONSE" >> $GITHUB_OUTPUT
 
-      - name: Read drops count
+      - name: Extract drops count
         id: parse
         run: |
-          DROPS=$(python -c "import json; print(json.load(open('response.json')).get('drops',0))")
-          CHECKED=$(python -c "import json; print(json.load(open('response.json')).get('checked',0))")
-          UPDATED=$(python -c "import json; print(json.load(open('response.json')).get('updated',0))")
+          echo '${{ steps.call.outputs.response }}' > response.json
+          DROPS=$(jq '.drops' response.json)
+          CHECKED=$(jq '.checked' response.json)
+          UPDATED=$(jq '.updated' response.json)
           echo "drops=$DROPS" >> $GITHUB_OUTPUT
           echo "checked=$CHECKED" >> $GITHUB_OUTPUT
           echo "updated=$UPDATED" >> $GITHUB_OUTPUT
           echo "Drops: $DROPS | Checked: $CHECKED | Updated: $UPDATED"
 
-      - name: Send email via SendGrid (only if drops > 0)
+      - name: Send email if drops > 0
         if: steps.parse.outputs.drops != '0'
         env:
           SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
           TO_EMAIL: ${{ secrets.ALERT_EMAIL_TO }}
           FROM_EMAIL: ${{ secrets.SENDGRID_FROM_EMAIL }}
-          DROPS: ${{ steps.parse.outputs.drops }}
-          CHECKED: ${{ steps.parse.outputs.checked }}
-          UPDATED: ${{ steps.parse.outputs.updated }}
         run: |
-          python - <<'PY'
-import os, json, urllib.request
-
-api_key = os.environ["SENDGRID_API_KEY"]
-to_email = os.environ["TO_EMAIL"]
-from_email = os.environ["FROM_EMAIL"]
-
-drops = os.environ.get("DROPS","0")
-checked = os.environ.get("CHECKED","0")
-updated = os.environ.get("UPDATED","0")
-
-subject = f"FNDiT Alert: {drops} price drop(s) detected"
-body = (
-  f"FNDiT daily price check found {drops} price drop(s).\n"
-  f"Checked: {checked}\n"
-  f"Updated: {updated}\n\n"
-  "To view details, open your backend drops endpoint:\n"
-  "GET /drops?deviceId=<YOUR_DEVICE_ID>\n"
-)
-
-payload = {
-  "personalizations": [{"to": [{"email": to_email}]}],
-  "from": {"email": from_email},
-  "subject": subject,
-  "content": [{"type": "text/plain", "value": body}]
-}
-
-req = urllib.request.Request(
-  "https://api.sendgrid.com/v3/mail/send",
-  data=json.dumps(payload).encode("utf-8"),
-  headers={
-    "Authorization": f"Bearer {api_key}",
-    "Content-Type": "application/json"
-  },
-  method="POST"
-)
-
-with urllib.request.urlopen(req) as resp:
-  print("SendGrid status:", resp.status)
-PY
+          curl --request POST \
+            --url https://api.sendgrid.com/v3/mail/send \
+            --header "Authorization: Bearer $SENDGRID_API_KEY" \
+            --header "Content-Type: application/json" \
+            --data "{
+              \"personalizations\": [{\"to\": [{\"email\": \"$TO_EMAIL\"}]}],
+              \"from\": {\"email\": \"$FROM_EMAIL\"},
+              \"subject\": \"FNDiT Price Drop Alert\",
+              \"content\": [{
+                \"type\": \"text/plain\",
+                \"value\": \"FNDiT detected a price drop. Check your tracked items.\"
+              }]
+            }"
