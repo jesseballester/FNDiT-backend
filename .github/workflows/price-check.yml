@@ -1,0 +1,20 @@
+name: FNDiT Daily Price Check
+
+on:
+  schedule:
+    - cron: "5 7 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  run-price-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call FNDiT price checker
+        env:
+          PRICE_CHECK_URL: ${{ secrets.PRICE_CHECK_URL }}
+          CHECK_SECRET: ${{ secrets.CHECK_SECRET }}
+        run: |
+          echo "Calling price checker..."
+          curl -sS -f "${PRICE_CHECK_URL}?secret=${CHECK_SECRET}" | tee response.json
+          echo ""
+          echo "Done."
