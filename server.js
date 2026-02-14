@@ -11,6 +11,17 @@
 import express from "express";
 
 const app = express();
+app.use(express.json());
+
+const trackedQueries = []; // TEMP storage (we'll replace with a DB)
+
+app.post("/track", (req, res) => {
+  const { deviceId, query } = req.body || {};
+  if (!deviceId || !query) return res.status(400).json({ error: "Missing deviceId or query" });
+
+  trackedQueries.push({ deviceId, query, lastPrice: null, createdAt: Date.now() });
+  res.json({ ok: true });
+});
 const PORT = process.env.PORT || 3000;
 
 const SERPAPI_KEY = process.env.SERPAPI_KEY;
