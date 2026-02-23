@@ -5,9 +5,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 const SERPAPI_KEY = process.env.SERPAPI_KEY;
-
-// If you later re-enable eBay, keep these env vars.
-// (This file currently keeps eBay disabled in search/runSearch by default.)
+// Kept for future (not used in this file right now)
 const EBAY_CLIENT_ID = process.env.EBAY_CLIENT_ID;
 const EBAY_CLIENT_SECRET = process.env.EBAY_CLIENT_SECRET;
 
@@ -16,7 +14,7 @@ const CHECK_SECRET = process.env.CHECK_SECRET || "";
 const { Pool } = pg;
 
 if (!process.env.DATABASE_URL) {
-  console.warn("⚠️ Missing DATABASE_URL. Tracking endpoints will fail until it's set in Render.");
+  console.warn("⚠️ Missing DATABASE_URL. Tracking/DB features will fail until it's set in Render.");
 }
 
 const pool = new Pool({
@@ -46,40 +44,52 @@ function normalizeCondition(c) {
   return "new"; // default
 }
 
+function normalizeText(s) {
+  return (s || "")
+    .toString()
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 // --------------------
-// DB init + migrations
+// DB init + MIGRATIONS (fixes: column "condition" does not exist)
 // --------------------
 async function initDb() {
-  // Base tables
+  // Create base table if not exists (older versions already have this)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS tracked_searches (
       id BIGSERIAL PRIMARY KEY,
       device_id TEXT NOT NULL,
       query TEXT NOT NULL,
       query_key TEXT NOT NULL,
-      condition TEXT NOT NULL DEFAULT 'new',
       last_price NUMERIC,
       last_seen_at TIMESTAMPTZ,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
 
-  // Add constraint if it doesn't exist (device_id + query_key + condition unique)
-  // We create a named unique index safely.
+  // Add condition column if missing (this fixes your current error)
   await pool.query(`
-    DO $$
-    BEGIN
-      IF NOT EXISTS (
-        SELECT 1 FROM pg_indexes
-        WHERE schemaname = 'public'
-          AND indexname = 'tracked_searches_device_query_condition_uidx'
-      ) THEN
-        CREATE UNIQUE INDEX tracked_searches_device_query_condition_uidx
-        ON tracked_searches (device_id, query_key, condition);
-      END IF;
-    END$$;
+    ALTER TABLE tracked_searches
+    ADD COLUMN IF NOT EXISTS condition TEXT NOT NULL DEFAULT 'new';
   `);
 
+  // Drop old uniqueness constraint (from earlier UNIQUE(device_id, query_key))
+  // Default name is usually tracked_searches_device_id_query_key_key
+  await pool.query(`
+    ALTER TABLE tracked_searches
+    DROP CONSTRAINT IF EXISTS tracked_searches_device_id_query_key_key;
+  `);
+
+  // Add new uniqueness rule: device + query + condition
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS tracked_searches_device_query_condition_uidx
+    ON tracked_searches (device_id, query_key, condition);
+  `);
+
+  // Price drops table
   await pool.query(`
     CREATE TABLE IF NOT EXISTS price_drops (
       id BIGSERIAL PRIMARY KEY,
@@ -105,7 +115,7 @@ app.get("/", (_req, res) => {
 });
 
 // --------------------
-// TRACKING (Persistent) - condition-aware (default NEW)
+// TRACKING (Persistent) — condition-aware (default NEW)
 // --------------------
 app.post("/track", async (req, res) => {
   try {
@@ -198,7 +208,7 @@ app.get("/drops", async (req, res) => {
 });
 
 // --------------------
-// Search: Improved relevance + safer Top 3 + condition filter
+// Search: improved relevance + negative filters + NEW/USED/ANY
 // --------------------
 const STOPWORDS = new Set([
   "the","a","an","and","or","for","with","without","to","of","in","on","at","by",
@@ -206,15 +216,6 @@ const STOPWORDS = new Set([
   "size","uk","us","eu","mens","men","men's","womens","women","women's","kids","kid","child","children",
   "pack","set","bundle"
 ]);
-
-function normalizeText(s) {
-  return (s || "")
-    .toString()
-    .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
 
 function tokenizeQuery(q) {
   const norm = normalizeText(q);
@@ -268,7 +269,6 @@ function passesNegativeFilter(item, intent) {
   return true;
 }
 
-// Condition inference for Google Shopping results
 function isUsedLike(item) {
   const s = `${item.secondHand || ""} ${item.title || ""}`.toLowerCase();
   return (
@@ -288,13 +288,8 @@ function isUsedLike(item) {
 function filterByCondition(items, condition) {
   const cond = normalizeCondition(condition);
   if (cond === "any") return items;
-
-  if (cond === "used") {
-    return items.filter(isUsedLike);
-  }
-
-  // Default: new -> exclude used-like
-  return items.filter((x) => !isUsedLike(x));
+  if (cond === "used") return items.filter(isUsedLike);
+  return items.filter((x) => !isUsedLike(x)); // default new
 }
 
 function scoreItem(itemTitle, query, tokens) {
@@ -371,7 +366,7 @@ async function fetchGoogleShopping(q, country) {
         price,
         currency: "GBP",
         url: link,
-        secondHand: it.second_hand_condition || "", // helps with new/used filtering
+        secondHand: it.second_hand_condition || "",
         source: "google",
       };
     })
@@ -380,27 +375,23 @@ async function fetchGoogleShopping(q, country) {
 }
 
 /**
- * Unified search function used by /search and the price checker.
+ * Unified search used by /search and the price checker
  * condition defaults to NEW.
  */
 async function runSearch({ q, country = "GB", store = "Any", condition = "new" }) {
   const intent = getIntent(q);
 
-  // eBay is intentionally disabled here (you said you don’t like used items dominating).
-  // Keep store=eBay from breaking the app by returning empty.
+  // eBay intentionally disabled (kept compatible)
   if ((store || "").toLowerCase() === "ebay") {
     return { intent, results: [] };
   }
 
   let items = await fetchGoogleShopping(q, country);
 
-  // negative filters first
   items = items.filter((it) => passesNegativeFilter(it, intent));
-
-  // condition filter (default new)
   items = filterByCondition(items, condition);
 
-  // optional store-name filter (Nike/JD/etc)
+  // Optional store filter by name (Nike/JD/etc)
   let filtered = items;
   if (store && store.toLowerCase() !== "any") {
     const s = store.toLowerCase();
@@ -420,7 +411,7 @@ app.get("/search", async (req, res) => {
     const q = (req.query.q || "").toString().trim();
     const country = (req.query.country || "GB").toString().trim().toUpperCase();
     const store = (req.query.store || "Any").toString().trim();
-    const condition = normalizeCondition(req.query.condition || "new"); // default new
+    const condition = normalizeCondition(req.query.condition || "new");
 
     if (!q) return res.status(400).json({ error: "Missing q" });
 
@@ -432,7 +423,7 @@ app.get("/search", async (req, res) => {
 });
 
 // --------------------
-// PRICE CHECKER (Manual trigger) - condition-aware
+// PRICE CHECKER (Manual trigger) — condition-aware
 // --------------------
 app.get("/run-price-check", async (req, res) => {
   try {
@@ -458,7 +449,6 @@ app.get("/run-price-check", async (req, res) => {
       const condition = normalizeCondition(row.condition || "new");
       const oldPrice = row.last_price === null ? null : Number(row.last_price);
 
-      // Run search using the stored condition
       const { results } = await runSearch({
         q: query,
         country: "GB",
@@ -471,7 +461,7 @@ app.get("/run-price-check", async (req, res) => {
 
       checked += 1;
 
-      // Update last_seen_at always
+      // Always update last_seen_at even if no results
       if (newPrice === null || !Number.isFinite(newPrice)) {
         await pool.query(
           `UPDATE tracked_searches
@@ -482,7 +472,7 @@ app.get("/run-price-check", async (req, res) => {
         continue;
       }
 
-      // First time price set
+      // First time setting price
       if (oldPrice === null || !Number.isFinite(oldPrice)) {
         await pool.query(
           `UPDATE tracked_searches
@@ -494,7 +484,7 @@ app.get("/run-price-check", async (req, res) => {
         continue;
       }
 
-      // Detect drop
+      // Detect price drop
       if (newPrice < oldPrice) {
         await pool.query(
           `INSERT INTO price_drops (device_id, query_key, query, condition, old_price, new_price, currency)
@@ -504,7 +494,7 @@ app.get("/run-price-check", async (req, res) => {
         drops += 1;
       }
 
-      // Always update latest observed price
+      // Always store latest observed price
       await pool.query(
         `UPDATE tracked_searches
          SET last_price=$1, last_seen_at=NOW()
