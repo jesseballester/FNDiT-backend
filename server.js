@@ -5,6 +5,9 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 const SERPAPI_KEY = process.env.SERPAPI_KEY;
+
+// If you later re-enable eBay, keep these env vars.
+// (This file currently keeps eBay disabled in search/runSearch by default.)
 const EBAY_CLIENT_ID = process.env.EBAY_CLIENT_ID;
 const EBAY_CLIENT_SECRET = process.env.EBAY_CLIENT_SECRET;
 
@@ -26,20 +29,55 @@ const pool = new Pool({
 app.use(express.json());
 
 // --------------------
-// DB init
+// Helpers
+// --------------------
+function normalizeQueryKey(q) {
+  return (q || "")
+    .toString()
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+}
+
+function normalizeCondition(c) {
+  const v = (c || "new").toString().trim().toLowerCase();
+  if (v === "any") return "any";
+  if (v === "used") return "used";
+  return "new"; // default
+}
+
+// --------------------
+// DB init + migrations
 // --------------------
 async function initDb() {
+  // Base tables
   await pool.query(`
     CREATE TABLE IF NOT EXISTS tracked_searches (
       id BIGSERIAL PRIMARY KEY,
       device_id TEXT NOT NULL,
       query TEXT NOT NULL,
       query_key TEXT NOT NULL,
+      condition TEXT NOT NULL DEFAULT 'new',
       last_price NUMERIC,
       last_seen_at TIMESTAMPTZ,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      UNIQUE (device_id, query_key)
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+  `);
+
+  // Add constraint if it doesn't exist (device_id + query_key + condition unique)
+  // We create a named unique index safely.
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_indexes
+        WHERE schemaname = 'public'
+          AND indexname = 'tracked_searches_device_query_condition_uidx'
+      ) THEN
+        CREATE UNIQUE INDEX tracked_searches_device_query_condition_uidx
+        ON tracked_searches (device_id, query_key, condition);
+      END IF;
+    END$$;
   `);
 
   await pool.query(`
@@ -48,6 +86,7 @@ async function initDb() {
       device_id TEXT NOT NULL,
       query_key TEXT NOT NULL,
       query TEXT NOT NULL,
+      condition TEXT NOT NULL DEFAULT 'new',
       old_price NUMERIC NOT NULL,
       new_price NUMERIC NOT NULL,
       currency TEXT NOT NULL DEFAULT 'GBP',
@@ -58,14 +97,6 @@ async function initDb() {
   console.log("✅ DB ready: tracked_searches + price_drops");
 }
 
-function normalizeQueryKey(q) {
-  return (q || "")
-    .toString()
-    .trim()
-    .toLowerCase()
-    .replace(/\s+/g, " ");
-}
-
 // --------------------
 // Health
 // --------------------
@@ -74,25 +105,26 @@ app.get("/", (_req, res) => {
 });
 
 // --------------------
-// TRACKING (Persistent)
+// TRACKING (Persistent) - condition-aware (default NEW)
 // --------------------
 app.post("/track", async (req, res) => {
   try {
-    const { deviceId, query } = req.body || {};
+    const { deviceId, query, condition } = req.body || {};
     if (!deviceId || !query) {
       return res.status(400).json({ error: "Missing deviceId or query" });
     }
 
     const queryKey = normalizeQueryKey(query);
+    const cond = normalizeCondition(condition); // default new
 
     await pool.query(
       `
-      INSERT INTO tracked_searches (device_id, query, query_key)
-      VALUES ($1, $2, $3)
-      ON CONFLICT (device_id, query_key)
+      INSERT INTO tracked_searches (device_id, query, query_key, condition)
+      VALUES ($1, $2, $3, $4)
+      ON CONFLICT (device_id, query_key, condition)
       DO UPDATE SET query = EXCLUDED.query
       `,
-      [deviceId, query, queryKey]
+      [deviceId, query, queryKey, cond]
     );
 
     res.json({ ok: true });
@@ -103,16 +135,17 @@ app.post("/track", async (req, res) => {
 
 app.post("/untrack", async (req, res) => {
   try {
-    const { deviceId, query } = req.body || {};
+    const { deviceId, query, condition } = req.body || {};
     if (!deviceId || !query) {
       return res.status(400).json({ error: "Missing deviceId or query" });
     }
 
     const queryKey = normalizeQueryKey(query);
+    const cond = normalizeCondition(condition);
 
     await pool.query(
-      `DELETE FROM tracked_searches WHERE device_id = $1 AND query_key = $2`,
-      [deviceId, queryKey]
+      `DELETE FROM tracked_searches WHERE device_id = $1 AND query_key = $2 AND condition = $3`,
+      [deviceId, queryKey, cond]
     );
 
     res.json({ ok: true });
@@ -128,7 +161,7 @@ app.get("/tracked", async (req, res) => {
 
     const r = await pool.query(
       `
-      SELECT query, last_price, last_seen_at, created_at
+      SELECT query, condition, last_price, last_seen_at, created_at
       FROM tracked_searches
       WHERE device_id = $1
       ORDER BY created_at DESC
@@ -142,7 +175,6 @@ app.get("/tracked", async (req, res) => {
   }
 });
 
-// View recorded drops (for later app UI)
 app.get("/drops", async (req, res) => {
   try {
     const deviceId = (req.query.deviceId || "").toString().trim();
@@ -150,7 +182,7 @@ app.get("/drops", async (req, res) => {
 
     const r = await pool.query(
       `
-      SELECT query, old_price, new_price, currency, detected_at
+      SELECT query, condition, old_price, new_price, currency, detected_at
       FROM price_drops
       WHERE device_id = $1
       ORDER BY detected_at DESC
@@ -166,7 +198,7 @@ app.get("/drops", async (req, res) => {
 });
 
 // --------------------
-// Search: Improved relevance + safer Top 3 (Google default)
+// Search: Improved relevance + safer Top 3 + condition filter
 // --------------------
 const STOPWORDS = new Set([
   "the","a","an","and","or","for","with","without","to","of","in","on","at","by",
@@ -236,6 +268,35 @@ function passesNegativeFilter(item, intent) {
   return true;
 }
 
+// Condition inference for Google Shopping results
+function isUsedLike(item) {
+  const s = `${item.secondHand || ""} ${item.title || ""}`.toLowerCase();
+  return (
+    s.includes("used") ||
+    s.includes("pre-owned") ||
+    s.includes("preowned") ||
+    s.includes("second hand") ||
+    s.includes("secondhand") ||
+    s.includes("refurb") ||
+    s.includes("refurbished") ||
+    s.includes("renewed") ||
+    s.includes("open box") ||
+    s.includes("open-box")
+  );
+}
+
+function filterByCondition(items, condition) {
+  const cond = normalizeCondition(condition);
+  if (cond === "any") return items;
+
+  if (cond === "used") {
+    return items.filter(isUsedLike);
+  }
+
+  // Default: new -> exclude used-like
+  return items.filter((x) => !isUsedLike(x));
+}
+
 function scoreItem(itemTitle, query, tokens) {
   const title = normalizeText(itemTitle);
   if (!title) return 0;
@@ -277,6 +338,7 @@ function rankAndPickTop3(items, query) {
     .map(({ _score, ...rest }) => rest);
 }
 
+// SerpApi: Google Shopping
 async function fetchGoogleShopping(q, country) {
   if (!SERPAPI_KEY) throw new Error("Missing SERPAPI_KEY");
 
@@ -302,12 +364,14 @@ async function fetchGoogleShopping(q, country) {
       if (!Number.isFinite(price)) return null;
 
       const link = it.product_link || it.link || "";
+
       return {
         title: it.title || "Item",
         store: it.source || "Google Shopping",
         price,
         currency: "GBP",
         url: link,
+        secondHand: it.second_hand_condition || "", // helps with new/used filtering
         source: "google",
       };
     })
@@ -317,22 +381,26 @@ async function fetchGoogleShopping(q, country) {
 
 /**
  * Unified search function used by /search and the price checker.
- * Right now: Google Shopping only unless store=eBay.
+ * condition defaults to NEW.
  */
-async function runSearch({ q, country = "GB", store = "Any" }) {
+async function runSearch({ q, country = "GB", store = "Any", condition = "new" }) {
   const intent = getIntent(q);
 
-  // eBay support (optional). If you’re not using it right now, it will just return empty.
-  // Kept here so your existing app doesn’t break if store=eBay is selected.
-  if (store.toLowerCase() === "ebay") {
-    // If you want eBay live again later, we can re-add it here.
+  // eBay is intentionally disabled here (you said you don’t like used items dominating).
+  // Keep store=eBay from breaking the app by returning empty.
+  if ((store || "").toLowerCase() === "ebay") {
     return { intent, results: [] };
   }
 
   let items = await fetchGoogleShopping(q, country);
-  items = items.filter(it => passesNegativeFilter(it, intent));
 
-  // Optional store-name filtering (Nike/JD/etc)
+  // negative filters first
+  items = items.filter((it) => passesNegativeFilter(it, intent));
+
+  // condition filter (default new)
+  items = filterByCondition(items, condition);
+
+  // optional store-name filter (Nike/JD/etc)
   let filtered = items;
   if (store && store.toLowerCase() !== "any") {
     const s = store.toLowerCase();
@@ -343,23 +411,28 @@ async function runSearch({ q, country = "GB", store = "Any" }) {
   return { intent, results: top3 };
 }
 
+/**
+ * GET /search?q=...&country=GB&store=Any&condition=new|used|any
+ * Default condition is NEW.
+ */
 app.get("/search", async (req, res) => {
   try {
     const q = (req.query.q || "").toString().trim();
     const country = (req.query.country || "GB").toString().trim().toUpperCase();
     const store = (req.query.store || "Any").toString().trim();
+    const condition = normalizeCondition(req.query.condition || "new"); // default new
 
     if (!q) return res.status(400).json({ error: "Missing q" });
 
-    const { intent, results } = await runSearch({ q, country, store });
-    res.json({ query: q, store, intent, results });
+    const { intent, results } = await runSearch({ q, country, store, condition });
+    res.json({ query: q, store, condition, intent, results });
   } catch (e) {
     res.status(500).json({ error: "Server error", detail: String(e) });
   }
 });
 
 // --------------------
-// PRICE CHECKER (Manual trigger)
+// PRICE CHECKER (Manual trigger) - condition-aware
 // --------------------
 app.get("/run-price-check", async (req, res) => {
   try {
@@ -368,9 +441,8 @@ app.get("/run-price-check", async (req, res) => {
       return res.status(401).json({ error: "Unauthorized" });
     }
 
-    // Pull all tracked searches
     const r = await pool.query(`
-      SELECT device_id, query, query_key, last_price
+      SELECT device_id, query, query_key, condition, last_price
       FROM tracked_searches
       ORDER BY created_at ASC
     `);
@@ -383,12 +455,17 @@ app.get("/run-price-check", async (req, res) => {
       const deviceId = row.device_id;
       const query = row.query;
       const queryKey = row.query_key;
+      const condition = normalizeCondition(row.condition || "new");
       const oldPrice = row.last_price === null ? null : Number(row.last_price);
 
-      // Run search (UK first; store Any)
-      const { results } = await runSearch({ q: query, country: "GB", store: "Any" });
+      // Run search using the stored condition
+      const { results } = await runSearch({
+        q: query,
+        country: "GB",
+        store: "Any",
+        condition,
+      });
 
-      // Determine cheapest (if any)
       const cheapest = results?.length ? results[0] : null;
       const newPrice = cheapest ? Number(cheapest.price) : null;
 
@@ -397,36 +474,42 @@ app.get("/run-price-check", async (req, res) => {
       // Update last_seen_at always
       if (newPrice === null || !Number.isFinite(newPrice)) {
         await pool.query(
-          `UPDATE tracked_searches SET last_seen_at = NOW() WHERE device_id=$1 AND query_key=$2`,
-          [deviceId, queryKey]
+          `UPDATE tracked_searches
+           SET last_seen_at = NOW()
+           WHERE device_id=$1 AND query_key=$2 AND condition=$3`,
+          [deviceId, queryKey, condition]
         );
         continue;
       }
 
-      // If first time, just set last_price
+      // First time price set
       if (oldPrice === null || !Number.isFinite(oldPrice)) {
         await pool.query(
-          `UPDATE tracked_searches SET last_price=$1, last_seen_at=NOW() WHERE device_id=$2 AND query_key=$3`,
-          [newPrice, deviceId, queryKey]
+          `UPDATE tracked_searches
+           SET last_price=$1, last_seen_at=NOW()
+           WHERE device_id=$2 AND query_key=$3 AND condition=$4`,
+          [newPrice, deviceId, queryKey, condition]
         );
         updated += 1;
         continue;
       }
 
-      // If price dropped, record it
+      // Detect drop
       if (newPrice < oldPrice) {
         await pool.query(
-          `INSERT INTO price_drops (device_id, query_key, query, old_price, new_price, currency)
-           VALUES ($1,$2,$3,$4,$5,$6)`,
-          [deviceId, queryKey, query, oldPrice, newPrice, cheapest.currency || "GBP"]
+          `INSERT INTO price_drops (device_id, query_key, query, condition, old_price, new_price, currency)
+           VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+          [deviceId, queryKey, query, condition, oldPrice, newPrice, cheapest.currency || "GBP"]
         );
         drops += 1;
       }
 
-      // Always set last_price to newest observed price
+      // Always update latest observed price
       await pool.query(
-        `UPDATE tracked_searches SET last_price=$1, last_seen_at=NOW() WHERE device_id=$2 AND query_key=$3`,
-        [newPrice, deviceId, queryKey]
+        `UPDATE tracked_searches
+         SET last_price=$1, last_seen_at=NOW()
+         WHERE device_id=$2 AND query_key=$3 AND condition=$4`,
+        [newPrice, deviceId, queryKey, condition]
       );
       updated += 1;
     }
