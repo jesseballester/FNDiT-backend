@@ -199,7 +199,7 @@ app.get("/drops", async (req, res) => {
 });
 
 // --------------------
-// Search Accuracy Improvements (Option A)
+// Search Accuracy Improvements + Best Deal
 // --------------------
 
 // Stopwords: remove common/low-signal terms from token set
@@ -284,8 +284,33 @@ function filterByCondition(items, condition) {
   return items.filter(x => !isUsedLike(x)); // default new
 }
 
-// Scoring: stronger model matching + gender penalties + token boosts
-function scoreItem(itemTitle, query, tokens) {
+// Trusted store boost (small but meaningful)
+const TRUSTED_STORE_KEYWORDS = [
+  "nike",
+  "adidas",
+  "jd",
+  "jdsports",
+  "foot locker",
+  "footlocker",
+  "pro direct",
+  "prodirect",
+  "decathlon",
+  "sports direct",
+  "amazon",
+  "argos",
+  "john lewis",
+  "selfridges",
+  "house of fraser"
+];
+
+function storeTrustScore(storeName) {
+  const s = (storeName || "").toLowerCase();
+  if (!s) return 0;
+  return TRUSTED_STORE_KEYWORDS.some(k => s.includes(k)) ? 6 : 0;
+}
+
+// Scoring: strong model matching + gender penalties + token boosts + trust boost
+function scoreItem(itemTitle, itemStore, query, tokens) {
   const title = normalizeText(itemTitle);
   if (!title) return -999;
 
@@ -321,6 +346,9 @@ function scoreItem(itemTitle, query, tokens) {
     if (title.includes("men") || title.includes("mens") || title.includes("kid") || title.includes("kids")) score -= 8;
   }
 
+  // Trust boost (helps users click with confidence)
+  score += storeTrustScore(itemStore);
+
   // Tiny titles are often junk
   if (title.length < 12) score -= 2;
 
@@ -353,7 +381,7 @@ function rankAndPickTop3(items, query) {
   const gated = coreTokenGate(items, query);
 
   return gated
-    .map(it => ({ ...it, _score: scoreItem(it.title, query, tokens) }))
+    .map(it => ({ ...it, _score: scoreItem(it.title, it.store, query, tokens) }))
     .sort((a, b) => {
       // Higher score first; if tie, cheaper first
       if (b._score !== a._score) return b._score - a._score;
@@ -361,6 +389,47 @@ function rankAndPickTop3(items, query) {
     })
     .slice(0, 3)
     .map(({ _score, ...rest }) => rest);
+}
+
+// Best Deal annotation (recommended threshold: >=10% OR >=£10 vs median)
+function median(values) {
+  if (!values.length) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
+}
+
+function annotateBestDeal(top3, poolItems) {
+  if (!top3 || top3.length === 0) return top3;
+
+  const pool = (poolItems || []).slice(0, 20);
+  const prices = pool
+    .map(r => Number(r.price))
+    .filter(p => Number.isFinite(p) && p > 0);
+
+  const med = median(prices);
+  if (!Number.isFinite(med) || med <= 0) {
+    return top3.map(r => ({ ...r, isBestDeal: false, savingsVsMedian: 0, savingsPctVsMedian: 0 }));
+  }
+
+  // Find cheapest among top3 (usually index 0, but we don't assume)
+  const cheapestIndex = top3.reduce(
+    (bestIdx, r, i) => (Number(r.price) < Number(top3[bestIdx].price) ? i : bestIdx),
+    0
+  );
+
+  const cheapest = top3[cheapestIndex];
+  const savings = +(med - Number(cheapest.price)).toFixed(2);
+  const savingsPct = +(((med - Number(cheapest.price)) / med) * 100).toFixed(0);
+
+  const isBest = (savingsPct >= 10) || (savings >= 10);
+
+  return top3.map((r, i) => ({
+    ...r,
+    isBestDeal: isBest && i === cheapestIndex,
+    savingsVsMedian: isBest && i === cheapestIndex ? Math.max(0, savings) : 0,
+    savingsPctVsMedian: isBest && i === cheapestIndex ? Math.max(0, savingsPct) : 0,
+  }));
 }
 
 // --------------------
@@ -427,8 +496,13 @@ async function runSearch({ q, country = "GB", store = "Any", condition = "new" }
     items = items.filter(x => (x.store || "").toLowerCase().includes(s));
   }
 
+  // Pool for median stats (take 20 cheapest *after* filtering)
+  const poolForStats = [...items].sort((a, b) => a.price - b.price).slice(0, 20);
+
   const top3 = rankAndPickTop3(items, q);
-  return { intent, results: top3 };
+  const annotated = annotateBestDeal(top3, poolForStats);
+
+  return { intent, results: annotated };
 }
 
 /**
