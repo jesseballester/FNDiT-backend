@@ -7,10 +7,6 @@ const PORT = process.env.PORT || 3000;
 const SERPAPI_KEY = process.env.SERPAPI_KEY;
 const CHECK_SECRET = process.env.CHECK_SECRET || "";
 
-// (Kept for future; not used right now)
-const EBAY_CLIENT_ID = process.env.EBAY_CLIENT_ID;
-const EBAY_CLIENT_SECRET = process.env.EBAY_CLIENT_SECRET;
-
 const { Pool } = pg;
 
 const pool = new Pool({
@@ -37,7 +33,7 @@ function normalizeCondition(c) {
   const v = (c || "new").toString().trim().toLowerCase();
   if (v === "any") return "any";
   if (v === "used") return "used";
-  return "new"; // default
+  return "new";
 }
 
 function normalizeText(s) {
@@ -49,11 +45,15 @@ function normalizeText(s) {
     .trim();
 }
 
+function safeNumber(n) {
+  const x = Number(n);
+  return Number.isFinite(x) ? x : null;
+}
+
 // --------------------
 // DB init + migrations
 // --------------------
 async function initDb() {
-  // Base table (older installs may already have it)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS tracked_searches (
       id BIGSERIAL PRIMARY KEY,
@@ -66,13 +66,13 @@ async function initDb() {
     );
   `);
 
-  // Add condition column (fixes: column "condition" does not exist)
+  // Fix: ensure condition exists
   await pool.query(`
     ALTER TABLE tracked_searches
     ADD COLUMN IF NOT EXISTS condition TEXT NOT NULL DEFAULT 'new';
   `);
 
-  // Drop old unique constraint (from previous UNIQUE(device_id, query_key))
+  // Remove old unique constraint if it existed
   await pool.query(`
     ALTER TABLE tracked_searches
     DROP CONSTRAINT IF EXISTS tracked_searches_device_id_query_key_key;
@@ -84,7 +84,6 @@ async function initDb() {
     ON tracked_searches (device_id, query_key, condition);
   `);
 
-  // Price drops log
   await pool.query(`
     CREATE TABLE IF NOT EXISTS price_drops (
       id BIGSERIAL PRIMARY KEY,
@@ -99,7 +98,7 @@ async function initDb() {
     );
   `);
 
-  console.log("✅ DB ready: tracked_searches + price_drops");
+  console.log("✅ DB ready");
 }
 
 // --------------------
@@ -110,7 +109,7 @@ app.get("/", (_req, res) => {
 });
 
 // --------------------
-// Tracking (condition-aware; default NEW)
+// Tracking
 // --------------------
 app.post("/track", async (req, res) => {
   try {
@@ -199,7 +198,7 @@ app.get("/drops", async (req, res) => {
 });
 
 // --------------------
-// Search Accuracy Improvements + Best Deal
+// Search: Accuracy + Best Deal + Query Expansion
 // --------------------
 
 // Stopwords: remove common/low-signal terms from token set
@@ -220,7 +219,7 @@ function tokenizeQuery(q) {
 // Intent detection (used for negative filters)
 function looksLikeFootwear(q) {
   const s = normalizeText(q);
-  const keys = ["shoe","shoes","trainer","trainers","sneaker","sneakers","boot","boots","football","cleats","air max","airmax"];
+  const keys = ["shoe","shoes","trainer","trainers","sneaker","sneakers","boot","boots","air max","airmax","air force","airforce","jordan","dunk","samba","gazelle"];
   return keys.some(k => s.includes(k));
 }
 function looksLikeClothing(q) {
@@ -234,7 +233,7 @@ function getIntent(q) {
   return "general";
 }
 
-// Strong negative filters (avoid accessories / irrelevant)
+// Negative filters (avoid accessories / irrelevant)
 const NEGATIVE_COMMON = [
   "phone case","case for","cover","screen protector","tempered glass","camera lens",
   "sticker","skin","strap","lanyard","keychain","key ring","holder","stand"
@@ -281,26 +280,13 @@ function filterByCondition(items, condition) {
   const cond = normalizeCondition(condition);
   if (cond === "any") return items;
   if (cond === "used") return items.filter(isUsedLike);
-  return items.filter(x => !isUsedLike(x)); // default new
+  return items.filter(x => !isUsedLike(x));
 }
 
-// Trusted store boost (small but meaningful)
+// Trusted store boost
 const TRUSTED_STORE_KEYWORDS = [
-  "nike",
-  "adidas",
-  "jd",
-  "jdsports",
-  "foot locker",
-  "footlocker",
-  "pro direct",
-  "prodirect",
-  "decathlon",
-  "sports direct",
-  "amazon",
-  "argos",
-  "john lewis",
-  "selfridges",
-  "house of fraser"
+  "nike","adidas","jd","jdsports","foot locker","footlocker","pro direct","prodirect",
+  "decathlon","sports direct","amazon","argos","john lewis","selfridges","house of fraser"
 ];
 
 function storeTrustScore(storeName) {
@@ -309,7 +295,7 @@ function storeTrustScore(storeName) {
   return TRUSTED_STORE_KEYWORDS.some(k => s.includes(k)) ? 6 : 0;
 }
 
-// Scoring: strong model matching + gender penalties + token boosts + trust boost
+// Scoring
 function scoreItem(itemTitle, itemStore, query, tokens) {
   const title = normalizeText(itemTitle);
   if (!title) return -999;
@@ -317,25 +303,21 @@ function scoreItem(itemTitle, itemStore, query, tokens) {
   let score = 0;
   const qNorm = normalizeText(query);
 
-  // Token matches (core relevance)
   for (const tok of tokens) {
     if (title.includes(tok)) score += 3;
   }
 
-  // Model numbers: big boost if matches; penalty if missing
   const modelNumbers = qNorm.match(/\b\d{2,4}\b/g) || [];
   for (const n of modelNumbers) {
     if (title.includes(n)) score += 8;
     else score -= 4;
   }
 
-  // Phrase boost for common sneaker phrase
   if ((qNorm.includes("air max") || qNorm.includes("airmax")) &&
       (title.includes("air max") || title.includes("airmax"))) {
     score += 8;
   }
 
-  // Gender penalties
   const qMen = qNorm.includes(" men") || qNorm.includes(" mens") || qNorm.includes("men ") || qNorm.includes("mens");
   const qWomen = qNorm.includes(" women") || qNorm.includes(" womens") || qNorm.includes("women ") || qNorm.includes("womens");
 
@@ -346,21 +328,18 @@ function scoreItem(itemTitle, itemStore, query, tokens) {
     if (title.includes("men") || title.includes("mens") || title.includes("kid") || title.includes("kids")) score -= 8;
   }
 
-  // Trust boost (helps users click with confidence)
   score += storeTrustScore(itemStore);
 
-  // Tiny titles are often junk
   if (title.length < 12) score -= 2;
 
   return score;
 }
 
-// Require core token overlap BEFORE scoring/ranking
+// Require core token overlap BEFORE ranking
 function coreTokenGate(items, query) {
   const tokens = tokenizeQuery(query);
   if (tokens.length === 0) return items;
 
-  // For short queries, require fewer matches; for longer queries require more
   const required = Math.min(3, Math.max(1, Math.ceil(tokens.length * 0.5)));
 
   return items.filter(it => {
@@ -376,14 +355,11 @@ function coreTokenGate(items, query) {
 
 function rankAndPickTop3(items, query) {
   const tokens = tokenizeQuery(query);
-
-  // Gate first (removes most irrelevant results)
   const gated = coreTokenGate(items, query);
 
   return gated
     .map(it => ({ ...it, _score: scoreItem(it.title, it.store, query, tokens) }))
     .sort((a, b) => {
-      // Higher score first; if tie, cheaper first
       if (b._score !== a._score) return b._score - a._score;
       return a.price - b.price;
     })
@@ -391,7 +367,6 @@ function rankAndPickTop3(items, query) {
     .map(({ _score, ...rest }) => rest);
 }
 
-// Best Deal annotation (recommended threshold: >=10% OR >=£10 vs median)
 function median(values) {
   if (!values.length) return null;
   const sorted = [...values].sort((a, b) => a - b);
@@ -404,7 +379,7 @@ function annotateBestDeal(top3, poolItems) {
 
   const pool = (poolItems || []).slice(0, 20);
   const prices = pool
-    .map(r => Number(r.price))
+    .map(r => safeNumber(r.price))
     .filter(p => Number.isFinite(p) && p > 0);
 
   const med = median(prices);
@@ -412,7 +387,6 @@ function annotateBestDeal(top3, poolItems) {
     return top3.map(r => ({ ...r, isBestDeal: false, savingsVsMedian: 0, savingsPctVsMedian: 0 }));
   }
 
-  // Find cheapest among top3 (usually index 0, but we don't assume)
   const cheapestIndex = top3.reduce(
     (bestIdx, r, i) => (Number(r.price) < Number(top3[bestIdx].price) ? i : bestIdx),
     0
@@ -430,6 +404,82 @@ function annotateBestDeal(top3, poolItems) {
     savingsVsMedian: isBest && i === cheapestIndex ? Math.max(0, savings) : 0,
     savingsPctVsMedian: isBest && i === cheapestIndex ? Math.max(0, savingsPct) : 0,
   }));
+}
+
+// --------------------
+// Query expansion (the new feature)
+// --------------------
+function hasBrandOrModelSignal(q) {
+  const s = normalizeText(q);
+  // if query already has clear brand/model intent, expand less
+  const brandWords = ["nike","adidas","puma","new balance","nb","asics","reebok","under armour","north face","the north face","jordan"];
+  return brandWords.some(b => s.includes(b)) || /\b\d{2,4}\b/.test(s);
+}
+
+function extractSizeHints(q) {
+  // Try to preserve sizing hints user typed (UK size or clothing size)
+  const s = normalizeText(q);
+  const hints = [];
+
+  // UK shoe size like "size 9 uk" or "9 uk"
+  const uk = s.match(/\b(size\s*)?(\d{1,2}(\.\d)?)\s*uk\b/);
+  if (uk?.[2]) hints.push(`size ${uk[2]} uk`);
+
+  // Clothing sizes XS/S/M/L/XL/XXL
+  const cloth = s.match(/\b(xs|s|m|l|xl|xxl)\b/);
+  if (cloth?.[1]) hints.push(`size ${cloth[1].toUpperCase()}`);
+
+  // gender words
+  if (s.includes("men") || s.includes("mens")) hints.push("men");
+  if (s.includes("women") || s.includes("womens")) hints.push("women");
+  if (s.includes("kids") || s.includes("kid") || s.includes("children")) hints.push("kids");
+
+  return Array.from(new Set(hints));
+}
+
+function expandQueries(original, intent) {
+  const q = original.trim();
+  const s = normalizeText(q);
+  const sizeHints = extractSizeHints(q);
+
+  // base always included
+  const out = [q];
+
+  // If already very specific, we keep expansions minimal.
+  const strongSignal = hasBrandOrModelSignal(q);
+
+  const add = (x) => {
+    const v = x.trim();
+    if (!v) return;
+    if (!out.some(o => normalizeQueryKey(o) === normalizeQueryKey(v))) out.push(v);
+  };
+
+  // Add intent words for better shopping results
+  if (intent === "footwear") {
+    add(`${q} trainers`);
+    add(`${q} shoes`);
+    if (!strongSignal) add(`${q} mens trainers`);
+  } else if (intent === "clothing") {
+    add(`${q} jacket`);
+    add(`${q} hoodie`);
+    if (!strongSignal) add(`${q} mens`);
+  } else {
+    // general items
+    add(`${q} price`);
+    add(`${q} buy`);
+  }
+
+  // If the user included size/gender hints, ensure expansions keep them
+  if (sizeHints.length) {
+    const hintString = sizeHints.join(" ");
+    // Attach hints to base query and one expansion
+    add(`${q} ${hintString}`);
+    if (intent === "footwear") add(`${q} trainers ${hintString}`);
+    if (intent === "clothing") add(`${q} ${hintString}`);
+  }
+
+  // Limit to 4 total (keeps SerpApi cost predictable)
+  return out.slice(0, 4);
 }
 
 // --------------------
@@ -456,8 +506,8 @@ async function fetchGoogleShopping(q, country) {
 
   return (data.shopping_results || [])
     .map(it => {
-      const price = Number(it.extracted_price);
-      if (!Number.isFinite(price)) return null;
+      const price = safeNumber(it.extracted_price);
+      if (price === null) return null;
 
       const link = it.product_link || it.link || "";
       if (!link) return null;
@@ -475,16 +525,47 @@ async function fetchGoogleShopping(q, country) {
     .filter(Boolean);
 }
 
+function dedupeResults(items) {
+  const seen = new Set();
+  const out = [];
+
+  for (const it of items) {
+    const urlKey = (it.url || "").toString().trim().toLowerCase();
+    const titleKey = normalizeText(it.title);
+    const storeKey = normalizeText(it.store);
+
+    const key = urlKey || `${titleKey}__${storeKey}__${it.price}`;
+    if (seen.has(key)) continue;
+
+    seen.add(key);
+    out.push(it);
+  }
+
+  return out;
+}
+
 // Unified search used by /search and price checker
 async function runSearch({ q, country = "GB", store = "Any", condition = "new" }) {
   const intent = getIntent(q);
 
-  // eBay intentionally disabled here (kept compatible)
-  if ((store || "").toLowerCase() === "ebay") {
-    return { intent, results: [] };
-  }
+  // Build query expansions
+  const queries = expandQueries(q, intent);
 
-  let items = await fetchGoogleShopping(q, country);
+  // Fetch all in parallel (max 4)
+  const batches = await Promise.all(
+    queries.map(async (qq) => {
+      try {
+        const items = await fetchGoogleShopping(qq, country);
+        // keep original query used for debugging optionally
+        return items.map(x => ({ ...x, _fromQuery: qq }));
+      } catch (e) {
+        // If one expansion fails, don’t kill the whole request
+        return [];
+      }
+    })
+  );
+
+  let items = dedupeResults(batches.flat());
 
   // Negative filters + condition filter
   items = items.filter(it => passesNegativeFilter(it, intent));
@@ -496,18 +577,22 @@ async function runSearch({ q, country = "GB", store = "Any", condition = "new" }
     items = items.filter(x => (x.store || "").toLowerCase().includes(s));
   }
 
-  // Pool for median stats (take 20 cheapest *after* filtering)
+  // Pool for median stats (take 20 cheapest after filtering)
   const poolForStats = [...items].sort((a, b) => a.price - b.price).slice(0, 20);
 
+  // Rank with the ORIGINAL user query (not expansion query)
   const top3 = rankAndPickTop3(items, q);
   const annotated = annotateBestDeal(top3, poolForStats);
 
-  return { intent, results: annotated };
+  return {
+    intent,
+    expandedQueries: queries, // useful for debugging; you can remove later
+    results: annotated,
+  };
 }
 
 /**
  * GET /search?q=...&country=GB&store=Any&condition=new|used|any
- * Default condition is NEW.
  */
 app.get("/search", async (req, res) => {
   try {
@@ -518,8 +603,16 @@ app.get("/search", async (req, res) => {
 
     if (!q) return res.status(400).json({ error: "Missing q" });
 
-    const { intent, results } = await runSearch({ q, country, store, condition });
-    res.json({ query: q, store, condition, intent, results });
+    const out = await runSearch({ q, country, store, condition });
+    res.json({
+      query: q,
+      store,
+      condition,
+      intent: out.intent,
+      results: out.results,
+      // Keep for now (debug). Remove later if you want cleaner response:
+      expandedQueries: out.expandedQueries,
+    });
   } catch (e) {
     res.status(500).json({ error: "Server error", detail: String(e) });
   }
@@ -552,19 +645,18 @@ app.get("/run-price-check", async (req, res) => {
       const condition = normalizeCondition(row.condition || "new");
       const oldPrice = row.last_price === null ? null : Number(row.last_price);
 
-      const { results } = await runSearch({
+      const out = await runSearch({
         q: query,
         country: "GB",
         store: "Any",
         condition,
       });
 
-      const cheapest = results?.length ? results[0] : null;
+      const cheapest = out.results?.length ? out.results[0] : null;
       const newPrice = cheapest ? Number(cheapest.price) : null;
 
       checked += 1;
 
-      // Always update last_seen_at
       if (newPrice === null || !Number.isFinite(newPrice)) {
         await pool.query(
           `UPDATE tracked_searches
@@ -575,7 +667,6 @@ app.get("/run-price-check", async (req, res) => {
         continue;
       }
 
-      // First time
       if (oldPrice === null || !Number.isFinite(oldPrice)) {
         await pool.query(
           `UPDATE tracked_searches
@@ -587,7 +678,6 @@ app.get("/run-price-check", async (req, res) => {
         continue;
       }
 
-      // Price drop
       if (newPrice < oldPrice) {
         await pool.query(
           `INSERT INTO price_drops (device_id, query_key, query, condition, old_price, new_price, currency)
@@ -597,7 +687,6 @@ app.get("/run-price-check", async (req, res) => {
         drops += 1;
       }
 
-      // Always update latest
       await pool.query(
         `UPDATE tracked_searches
          SET last_price=$1, last_seen_at=NOW()
