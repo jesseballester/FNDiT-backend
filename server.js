@@ -5,17 +5,13 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 const SERPAPI_KEY = process.env.SERPAPI_KEY;
-// Kept for future (not used in this file right now)
+const CHECK_SECRET = process.env.CHECK_SECRET || "";
+
+// (Kept for future; not used right now)
 const EBAY_CLIENT_ID = process.env.EBAY_CLIENT_ID;
 const EBAY_CLIENT_SECRET = process.env.EBAY_CLIENT_SECRET;
 
-const CHECK_SECRET = process.env.CHECK_SECRET || "";
-
 const { Pool } = pg;
-
-if (!process.env.DATABASE_URL) {
-  console.warn("⚠️ Missing DATABASE_URL. Tracking/DB features will fail until it's set in Render.");
-}
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -54,10 +50,10 @@ function normalizeText(s) {
 }
 
 // --------------------
-// DB init + MIGRATIONS (fixes: column "condition" does not exist)
+// DB init + migrations
 // --------------------
 async function initDb() {
-  // Create base table if not exists (older versions already have this)
+  // Base table (older installs may already have it)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS tracked_searches (
       id BIGSERIAL PRIMARY KEY,
@@ -70,26 +66,25 @@ async function initDb() {
     );
   `);
 
-  // Add condition column if missing (this fixes your current error)
+  // Add condition column (fixes: column "condition" does not exist)
   await pool.query(`
     ALTER TABLE tracked_searches
     ADD COLUMN IF NOT EXISTS condition TEXT NOT NULL DEFAULT 'new';
   `);
 
-  // Drop old uniqueness constraint (from earlier UNIQUE(device_id, query_key))
-  // Default name is usually tracked_searches_device_id_query_key_key
+  // Drop old unique constraint (from previous UNIQUE(device_id, query_key))
   await pool.query(`
     ALTER TABLE tracked_searches
     DROP CONSTRAINT IF EXISTS tracked_searches_device_id_query_key_key;
   `);
 
-  // Add new uniqueness rule: device + query + condition
+  // New uniqueness: device + query + condition
   await pool.query(`
     CREATE UNIQUE INDEX IF NOT EXISTS tracked_searches_device_query_condition_uidx
     ON tracked_searches (device_id, query_key, condition);
   `);
 
-  // Price drops table
+  // Price drops log
   await pool.query(`
     CREATE TABLE IF NOT EXISTS price_drops (
       id BIGSERIAL PRIMARY KEY,
@@ -115,17 +110,15 @@ app.get("/", (_req, res) => {
 });
 
 // --------------------
-// TRACKING (Persistent) — condition-aware (default NEW)
+// Tracking (condition-aware; default NEW)
 // --------------------
 app.post("/track", async (req, res) => {
   try {
     const { deviceId, query, condition } = req.body || {};
-    if (!deviceId || !query) {
-      return res.status(400).json({ error: "Missing deviceId or query" });
-    }
+    if (!deviceId || !query) return res.status(400).json({ error: "Missing deviceId or query" });
 
     const queryKey = normalizeQueryKey(query);
-    const cond = normalizeCondition(condition); // default new
+    const cond = normalizeCondition(condition);
 
     await pool.query(
       `
@@ -146,15 +139,13 @@ app.post("/track", async (req, res) => {
 app.post("/untrack", async (req, res) => {
   try {
     const { deviceId, query, condition } = req.body || {};
-    if (!deviceId || !query) {
-      return res.status(400).json({ error: "Missing deviceId or query" });
-    }
+    if (!deviceId || !query) return res.status(400).json({ error: "Missing deviceId or query" });
 
     const queryKey = normalizeQueryKey(query);
     const cond = normalizeCondition(condition);
 
     await pool.query(
-      `DELETE FROM tracked_searches WHERE device_id = $1 AND query_key = $2 AND condition = $3`,
+      `DELETE FROM tracked_searches WHERE device_id=$1 AND query_key=$2 AND condition=$3`,
       [deviceId, queryKey, cond]
     );
 
@@ -173,7 +164,7 @@ app.get("/tracked", async (req, res) => {
       `
       SELECT query, condition, last_price, last_seen_at, created_at
       FROM tracked_searches
-      WHERE device_id = $1
+      WHERE device_id=$1
       ORDER BY created_at DESC
       `,
       [deviceId]
@@ -194,7 +185,7 @@ app.get("/drops", async (req, res) => {
       `
       SELECT query, condition, old_price, new_price, currency, detected_at
       FROM price_drops
-      WHERE device_id = $1
+      WHERE device_id=$1
       ORDER BY detected_at DESC
       LIMIT 50
       `,
@@ -208,8 +199,10 @@ app.get("/drops", async (req, res) => {
 });
 
 // --------------------
-// Search: improved relevance + negative filters + NEW/USED/ANY
+// Search Accuracy Improvements (Option A)
 // --------------------
+
+// Stopwords: remove common/low-signal terms from token set
 const STOPWORDS = new Set([
   "the","a","an","and","or","for","with","without","to","of","in","on","at","by",
   "new","brand","original","genuine","authentic",
@@ -224,34 +217,32 @@ function tokenizeQuery(q) {
   return Array.from(new Set(tokens));
 }
 
+// Intent detection (used for negative filters)
 function looksLikeFootwear(q) {
   const s = normalizeText(q);
   const keys = ["shoe","shoes","trainer","trainers","sneaker","sneakers","boot","boots","football","cleats","air max","airmax"];
   return keys.some(k => s.includes(k));
 }
-
 function looksLikeClothing(q) {
   const s = normalizeText(q);
   const keys = ["hoodie","tshirt","t-shirt","tee","shirt","polo","jacket","coat","jumper","sweater","tracksuit","jeans","trousers","pants","shorts","leggings","dress","skirt","top"];
   return keys.some(k => s.includes(k));
 }
-
 function getIntent(q) {
   if (looksLikeFootwear(q)) return "footwear";
   if (looksLikeClothing(q)) return "clothing";
   return "general";
 }
 
+// Strong negative filters (avoid accessories / irrelevant)
 const NEGATIVE_COMMON = [
   "phone case","case for","cover","screen protector","tempered glass","camera lens",
   "sticker","skin","strap","lanyard","keychain","key ring","holder","stand"
 ];
-
 const NEGATIVE_FOOTWEAR = [
   "laces","lace","insole","insoles","shoe cleaner","cleaner","protector spray","spray",
   "sock","socks","shoe bag","bag","replacement","repair","kit","insert"
 ];
-
 const NEGATIVE_CLOTHING = [
   "hanger","washing","laundry","detergent","patch","iron on","button","zipper","zip","thread"
 ];
@@ -269,6 +260,7 @@ function passesNegativeFilter(item, intent) {
   return true;
 }
 
+// Condition inference (Google Shopping sometimes supplies second_hand_condition)
 function isUsedLike(item) {
   const s = `${item.secondHand || ""} ${item.title || ""}`.toLowerCase();
   return (
@@ -289,43 +281,81 @@ function filterByCondition(items, condition) {
   const cond = normalizeCondition(condition);
   if (cond === "any") return items;
   if (cond === "used") return items.filter(isUsedLike);
-  return items.filter((x) => !isUsedLike(x)); // default new
+  return items.filter(x => !isUsedLike(x)); // default new
 }
 
+// Scoring: stronger model matching + gender penalties + token boosts
 function scoreItem(itemTitle, query, tokens) {
   const title = normalizeText(itemTitle);
-  if (!title) return 0;
+  if (!title) return -999;
 
   let score = 0;
-  for (const tok of tokens) {
-    if (title.includes(tok)) score += 2;
-  }
-
   const qNorm = normalizeText(query);
 
-  if ((qNorm.includes("air max") || qNorm.includes("airmax")) && (title.includes("air max") || title.includes("airmax"))) {
-    score += 6;
+  // Token matches (core relevance)
+  for (const tok of tokens) {
+    if (title.includes(tok)) score += 3;
   }
 
-  const nums = qNorm.match(/\b\d{2,4}\b/g) || [];
-  for (const n of nums) {
-    if (title.includes(n)) score += 4;
+  // Model numbers: big boost if matches; penalty if missing
+  const modelNumbers = qNorm.match(/\b\d{2,4}\b/g) || [];
+  for (const n of modelNumbers) {
+    if (title.includes(n)) score += 8;
+    else score -= 4;
   }
 
-  if (qNorm.includes("men") || qNorm.includes("mens") || qNorm.includes("men's")) {
-    if (title.includes("women") || title.includes("womens") || title.includes("kid") || title.includes("kids")) score -= 4;
+  // Phrase boost for common sneaker phrase
+  if ((qNorm.includes("air max") || qNorm.includes("airmax")) &&
+      (title.includes("air max") || title.includes("airmax"))) {
+    score += 8;
   }
 
+  // Gender penalties
+  const qMen = qNorm.includes(" men") || qNorm.includes(" mens") || qNorm.includes("men ") || qNorm.includes("mens");
+  const qWomen = qNorm.includes(" women") || qNorm.includes(" womens") || qNorm.includes("women ") || qNorm.includes("womens");
+
+  if (qMen) {
+    if (title.includes("women") || title.includes("womens") || title.includes("kid") || title.includes("kids")) score -= 8;
+  }
+  if (qWomen) {
+    if (title.includes("men") || title.includes("mens") || title.includes("kid") || title.includes("kids")) score -= 8;
+  }
+
+  // Tiny titles are often junk
   if (title.length < 12) score -= 2;
 
   return score;
 }
 
+// Require core token overlap BEFORE scoring/ranking
+function coreTokenGate(items, query) {
+  const tokens = tokenizeQuery(query);
+  if (tokens.length === 0) return items;
+
+  // For short queries, require fewer matches; for longer queries require more
+  const required = Math.min(3, Math.max(1, Math.ceil(tokens.length * 0.5)));
+
+  return items.filter(it => {
+    const title = normalizeText(it.title);
+    if (!title) return false;
+    let hits = 0;
+    for (const t of tokens) {
+      if (title.includes(t)) hits += 1;
+    }
+    return hits >= required;
+  });
+}
+
 function rankAndPickTop3(items, query) {
   const tokens = tokenizeQuery(query);
-  return items
+
+  // Gate first (removes most irrelevant results)
+  const gated = coreTokenGate(items, query);
+
+  return gated
     .map(it => ({ ...it, _score: scoreItem(it.title, query, tokens) }))
     .sort((a, b) => {
+      // Higher score first; if tie, cheaper first
       if (b._score !== a._score) return b._score - a._score;
       return a.price - b.price;
     })
@@ -333,7 +363,9 @@ function rankAndPickTop3(items, query) {
     .map(({ _score, ...rest }) => rest);
 }
 
-// SerpApi: Google Shopping
+// --------------------
+// SerpApi Google Shopping fetch
+// --------------------
 async function fetchGoogleShopping(q, country) {
   if (!SERPAPI_KEY) throw new Error("Missing SERPAPI_KEY");
 
@@ -354,11 +386,12 @@ async function fetchGoogleShopping(q, country) {
   const data = await r.json();
 
   return (data.shopping_results || [])
-    .map((it) => {
+    .map(it => {
       const price = Number(it.extracted_price);
       if (!Number.isFinite(price)) return null;
 
       const link = it.product_link || it.link || "";
+      if (!link) return null;
 
       return {
         title: it.title || "Item",
@@ -370,35 +403,31 @@ async function fetchGoogleShopping(q, country) {
         source: "google",
       };
     })
-    .filter(Boolean)
-    .filter((x) => x.url);
+    .filter(Boolean);
 }
 
-/**
- * Unified search used by /search and the price checker
- * condition defaults to NEW.
- */
+// Unified search used by /search and price checker
 async function runSearch({ q, country = "GB", store = "Any", condition = "new" }) {
   const intent = getIntent(q);
 
-  // eBay intentionally disabled (kept compatible)
+  // eBay intentionally disabled here (kept compatible)
   if ((store || "").toLowerCase() === "ebay") {
     return { intent, results: [] };
   }
 
   let items = await fetchGoogleShopping(q, country);
 
-  items = items.filter((it) => passesNegativeFilter(it, intent));
+  // Negative filters + condition filter
+  items = items.filter(it => passesNegativeFilter(it, intent));
   items = filterByCondition(items, condition);
 
-  // Optional store filter by name (Nike/JD/etc)
-  let filtered = items;
+  // Optional store filter (string contains match)
   if (store && store.toLowerCase() !== "any") {
     const s = store.toLowerCase();
-    filtered = filtered.filter((x) => (x.store || "").toLowerCase().includes(s));
+    items = items.filter(x => (x.store || "").toLowerCase().includes(s));
   }
 
-  const top3 = rankAndPickTop3(filtered, q);
+  const top3 = rankAndPickTop3(items, q);
   return { intent, results: top3 };
 }
 
@@ -423,7 +452,7 @@ app.get("/search", async (req, res) => {
 });
 
 // --------------------
-// PRICE CHECKER (Manual trigger) — condition-aware
+// Price checker (manual trigger) — condition-aware
 // --------------------
 app.get("/run-price-check", async (req, res) => {
   try {
@@ -461,7 +490,7 @@ app.get("/run-price-check", async (req, res) => {
 
       checked += 1;
 
-      // Always update last_seen_at even if no results
+      // Always update last_seen_at
       if (newPrice === null || !Number.isFinite(newPrice)) {
         await pool.query(
           `UPDATE tracked_searches
@@ -472,7 +501,7 @@ app.get("/run-price-check", async (req, res) => {
         continue;
       }
 
-      // First time setting price
+      // First time
       if (oldPrice === null || !Number.isFinite(oldPrice)) {
         await pool.query(
           `UPDATE tracked_searches
@@ -484,7 +513,7 @@ app.get("/run-price-check", async (req, res) => {
         continue;
       }
 
-      // Detect price drop
+      // Price drop
       if (newPrice < oldPrice) {
         await pool.query(
           `INSERT INTO price_drops (device_id, query_key, query, condition, old_price, new_price, currency)
@@ -494,7 +523,7 @@ app.get("/run-price-check", async (req, res) => {
         drops += 1;
       }
 
-      // Always store latest observed price
+      // Always update latest
       await pool.query(
         `UPDATE tracked_searches
          SET last_price=$1, last_seen_at=NOW()
