@@ -102,7 +102,7 @@ app.get("/", (_req, res) => {
 });
 
 // =====================
-// Track / Untrack / Tracked
+// Track / Untrack / Tracked / Drops
 // =====================
 app.post("/track", async (req, res) => {
   try {
@@ -198,7 +198,7 @@ app.get("/drops", async (req, res) => {
 // Exact-match accuracy layer
 // =====================
 
-// Brand dictionary (expand anytime)
+// Brand dictionary (expanded with LEGO)
 const BRAND_ALIASES = [
   { key: "nike", variants: ["nike"] },
   { key: "adidas", variants: ["adidas"] },
@@ -210,6 +210,7 @@ const BRAND_ALIASES = [
   { key: "converse", variants: ["converse"] },
   { key: "vans", variants: ["vans"] },
   { key: "the north face", variants: ["the north face", "north face", "tnf"] },
+  { key: "lego", variants: ["lego"] }, // ✅ added
 ];
 
 // Aggressive accessory blocklist
@@ -300,9 +301,10 @@ function detectBrands(q) {
   return uniq(found);
 }
 
+// ✅ Updated: include 5–6 digit IDs (LEGO set numbers like 75331)
 function extractModelNumbers(q) {
   const t = normText(q);
-  const nums = t.match(/\b\d{2,4}\b/g) || [];
+  const nums = t.match(/\b\d{2,6}\b/g) || [];
   return uniq(nums);
 }
 
@@ -313,13 +315,9 @@ function detectGenderIntent(q) {
   const hasMen = MEN_TERMS.some((k) => t.includes(k));
   const hasWomen = WOMEN_TERMS.some((k) => t.includes(k));
 
-  // Explicit men/women wins
   if (hasMen) return "men";
   if (hasWomen) return "women";
-
-  // Otherwise, if it looks like kids
   if (hasKids) return "kids";
-
   return "any";
 }
 
@@ -368,25 +366,21 @@ function confidenceScore(itemTitle, itemStore, qTokens, qBrands, qModels, gender
 
   let score = 0;
 
-  // Token overlap
   for (const tok of qTokens) {
     if (title.includes(tok)) score += 3;
   }
 
-  // Brand boost
   for (const b of qBrands) {
     const bb = normText(b);
     if (title.includes(bb)) score += 12;
     else if (store.includes(bb)) score += 7;
   }
 
-  // Model number boost + penalty
   for (const m of qModels) {
     if (title.includes(m)) score += 14;
     else score -= 10;
   }
 
-  // Gender boost/penalty (soft scoring; hard gating happens separately)
   const isKids = KIDS_TERMS.some((k) => title.includes(k));
   const isMen = MEN_TERMS.some((k) => title.includes(k));
   const isWomen = WOMEN_TERMS.some((k) => title.includes(k));
@@ -404,7 +398,6 @@ function confidenceScore(itemTitle, itemStore, qTokens, qBrands, qModels, gender
     if (isMen || isWomen) score -= 8;
   }
 
-  // Penalize very short titles
   if (title.length < 12) score -= 4;
 
   return score;
@@ -416,10 +409,8 @@ function applyHardGates(items, qBrands, qModels, genderIntent) {
     const title = normText(it.title);
     const store = normText(it.store);
 
-    // accessory block
     if (containsAny(title, ACCESSORY_BLOCKLIST)) return false;
 
-    // brand lock
     if (qBrands.length) {
       const okBrand = qBrands.some((b) => {
         const bb = normText(b);
@@ -428,13 +419,11 @@ function applyHardGates(items, qBrands, qModels, genderIntent) {
       if (!okBrand) return false;
     }
 
-    // model lock
     if (qModels.length) {
       const okModel = qModels.some((m) => title.includes(m));
       if (!okModel) return false;
     }
 
-    // gender lock
     const isKids = KIDS_TERMS.some((k) => title.includes(k));
     const isMen = MEN_TERMS.some((k) => title.includes(k));
     const isWomen = WOMEN_TERMS.some((k) => title.includes(k));
@@ -446,7 +435,6 @@ function applyHardGates(items, qBrands, qModels, genderIntent) {
       if (isKids) return false;
       if (isMen) return false;
     } else if (genderIntent === "kids") {
-      // allow boys/girls/infant/newborn/etc
       if (isMen) return false;
       if (isWomen) return false;
     }
@@ -540,7 +528,7 @@ function annotateBestDeal(top3, poolItems) {
 // =====================
 function shouldExpandQuery(q, brands, models) {
   const tokens = tokenize(q);
-  if (brands.length || models.length) return tokens.length <= 5;
+  if (brands.length || models.length) return tokens.length <= 6;
   return tokens.length <= 4;
 }
 
@@ -605,7 +593,7 @@ async function fetchGoogleShopping(q, country = "GB") {
 }
 
 // =====================
-// Core search (EXACT MATCH MODE)
+// Core search (Exact Match + LEGO-friendly)
 // =====================
 async function runSearch({ q, country = "GB", store = "Any", condition = "new" }) {
   const qBrands = detectBrands(q);
@@ -627,19 +615,17 @@ async function runSearch({ q, country = "GB", store = "Any", condition = "new" }
 
   let items = dedupe(batches.flat());
 
-  // Store filter (optional)
   if (store && store.toLowerCase() !== "any") {
     const s = store.toLowerCase();
     items = items.filter((x) => (x.store || "").toLowerCase().includes(s));
   }
 
-  // Condition filter
   items = filterByCondition(items, condition);
 
   // HARD GATES (brand/model/gender/accessories)
   items = applyHardGates(items, qBrands, qModels, genderIntent);
 
-  // Score
+  // Score + sort
   const scored = items
     .map((it) => ({
       ...it,
@@ -650,14 +636,12 @@ async function runSearch({ q, country = "GB", store = "Any", condition = "new" }
       return a.price - b.price;
     });
 
-  // ✅ Exact mode: strict threshold, no fallback
-  const MIN_SCORE = qBrands.length || qModels.length ? 22 : 16;
-  const confident = scored.filter((x) => x._score >= MIN_SCORE);
+  // ✅ Exact mode: strict when brand/model present, less strict for general toys
+  const MIN_SCORE = qBrands.length || qModels.length ? 22 : 12;
 
-  const finalPool = confident;
+  const finalPool = scored.filter((x) => x._score >= MIN_SCORE);
 
   const poolForStats = [...finalPool].slice(0, 20).sort((a, b) => a.price - b.price);
-
   const top3 = finalPool.slice(0, 3).map(({ _score, ...rest }) => rest);
 
   const annotated = annotateBestDeal(top3, poolForStats);
