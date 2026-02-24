@@ -210,7 +210,7 @@ const BRAND_ALIASES = [
   { key: "converse", variants: ["converse"] },
   { key: "vans", variants: ["vans"] },
   { key: "the north face", variants: ["the north face", "north face", "tnf"] },
-  { key: "lego", variants: ["lego"] }, // ✅ added
+  { key: "lego", variants: ["lego"] },
 ];
 
 // Aggressive accessory blocklist
@@ -261,6 +261,25 @@ const ACCESSORY_BLOCKLIST = [
   "thread",
 ];
 
+// ✅ LEGO set mode: block parts/figures unless user asked for them
+const LEGO_PARTS_BLOCKLIST = [
+  "minifigure",
+  "mini figure",
+  "minifig",
+  "minifigs",
+  "figure",
+  "figures",
+  "badge",
+  "sticker",
+  "instructions",
+  "manual",
+  "replacement",
+  "spare",
+  "parts",
+  "piece",
+  "pieces",
+];
+
 // Kids/generalized terms (boys/girls/infant/etc.)
 const KIDS_TERMS = [
   "kid",
@@ -301,7 +320,7 @@ function detectBrands(q) {
   return uniq(found);
 }
 
-// ✅ Updated: include 5–6 digit IDs (LEGO set numbers like 75331)
+// ✅ include 5–6 digit IDs (LEGO set numbers like 75331)
 function extractModelNumbers(q) {
   const t = normText(q);
   const nums = t.match(/\b\d{2,6}\b/g) || [];
@@ -319,6 +338,20 @@ function detectGenderIntent(q) {
   if (hasWomen) return "women";
   if (hasKids) return "kids";
   return "any";
+}
+
+function isLegoSetIntent(q) {
+  const t = normText(q);
+  if (!t.includes("lego")) return false;
+
+  const wantsFigures =
+    t.includes("minifigure") ||
+    t.includes("minifig") ||
+    t.includes("figure") ||
+    t.includes("figures");
+
+  if (wantsFigures) return false;
+  return true;
 }
 
 const STOPWORDS = new Set([
@@ -403,14 +436,21 @@ function confidenceScore(itemTitle, itemStore, qTokens, qBrands, qModels, gender
   return score;
 }
 
-// HARD GATES: exact enforcement (brand/model/gender + accessory block)
-function applyHardGates(items, qBrands, qModels, genderIntent) {
+// HARD GATES: exact enforcement (brand/model/gender + accessory block + LEGO set mode)
+function applyHardGates(items, qBrands, qModels, genderIntent, originalQuery) {
+  const legoSetMode = isLegoSetIntent(originalQuery);
+
   return items.filter((it) => {
     const title = normText(it.title);
     const store = normText(it.store);
 
+    // accessories
     if (containsAny(title, ACCESSORY_BLOCKLIST)) return false;
 
+    // LEGO set mode: block parts/figures unless user asked
+    if (legoSetMode && containsAny(title, LEGO_PARTS_BLOCKLIST)) return false;
+
+    // brand lock
     if (qBrands.length) {
       const okBrand = qBrands.some((b) => {
         const bb = normText(b);
@@ -419,11 +459,13 @@ function applyHardGates(items, qBrands, qModels, genderIntent) {
       if (!okBrand) return false;
     }
 
+    // model lock
     if (qModels.length) {
       const okModel = qModels.some((m) => title.includes(m));
       if (!okModel) return false;
     }
 
+    // gender lock
     const isKids = KIDS_TERMS.some((k) => title.includes(k));
     const isMen = MEN_TERMS.some((k) => title.includes(k));
     const isWomen = WOMEN_TERMS.some((k) => title.includes(k));
@@ -593,13 +635,14 @@ async function fetchGoogleShopping(q, country = "GB") {
 }
 
 // =====================
-// Core search (Exact Match + LEGO-friendly)
+// Core search (Exact Match + LEGO set mode)
 // =====================
 async function runSearch({ q, country = "GB", store = "Any", condition = "new" }) {
   const qBrands = detectBrands(q);
   const qModels = extractModelNumbers(q);
   const qTokens = tokenize(q);
   const genderIntent = detectGenderIntent(q);
+  const legoSetMode = isLegoSetIntent(q);
 
   const queries = shouldExpandQuery(q, qBrands, qModels) ? expandQueries(q) : [q];
 
@@ -622,8 +665,8 @@ async function runSearch({ q, country = "GB", store = "Any", condition = "new" }
 
   items = filterByCondition(items, condition);
 
-  // HARD GATES (brand/model/gender/accessories)
-  items = applyHardGates(items, qBrands, qModels, genderIntent);
+  // HARD GATES (brand/model/gender/accessories + LEGO set mode)
+  items = applyHardGates(items, qBrands, qModels, genderIntent, q);
 
   // Score + sort
   const scored = items
@@ -636,8 +679,8 @@ async function runSearch({ q, country = "GB", store = "Any", condition = "new" }
       return a.price - b.price;
     });
 
-  // ✅ Exact mode: strict when brand/model present, less strict for general toys
-  const MIN_SCORE = qBrands.length || qModels.length ? 22 : 12;
+  // ✅ stricter for LEGO set searches without set number, still exact-ish
+  const MIN_SCORE = qBrands.length || qModels.length ? 22 : legoSetMode ? 16 : 12;
 
   const finalPool = scored.filter((x) => x._score >= MIN_SCORE);
 
