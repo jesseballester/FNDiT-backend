@@ -18,9 +18,6 @@ const pool = new Pool({
 
 app.use(express.json());
 
-// --------------------
-// Helpers
-// --------------------
 function normalizeQueryKey(q) {
   return (q || "")
     .toString()
@@ -36,23 +33,15 @@ function normalizeCondition(c) {
   return "new";
 }
 
-function normalizeText(s) {
-  return (s || "")
-    .toString()
-    .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
 function safeNumber(n) {
   const x = Number(n);
   return Number.isFinite(x) ? x : null;
 }
 
-// --------------------
-// DB init + migrations
-// --------------------
+/* ===============================
+   DATABASE INIT + MIGRATIONS
+================================ */
+
 async function initDb() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS tracked_searches (
@@ -60,25 +49,13 @@ async function initDb() {
       device_id TEXT NOT NULL,
       query TEXT NOT NULL,
       query_key TEXT NOT NULL,
+      condition TEXT NOT NULL DEFAULT 'new',
       last_price NUMERIC,
       last_seen_at TIMESTAMPTZ,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
 
-  // Fix: ensure condition exists
-  await pool.query(`
-    ALTER TABLE tracked_searches
-    ADD COLUMN IF NOT EXISTS condition TEXT NOT NULL DEFAULT 'new';
-  `);
-
-  // Remove old unique constraint if it existed
-  await pool.query(`
-    ALTER TABLE tracked_searches
-    DROP CONSTRAINT IF EXISTS tracked_searches_device_id_query_key_key;
-  `);
-
-  // New uniqueness: device + query + condition
   await pool.query(`
     CREATE UNIQUE INDEX IF NOT EXISTS tracked_searches_device_query_condition_uidx
     ON tracked_searches (device_id, query_key, condition);
@@ -90,7 +67,6 @@ async function initDb() {
       device_id TEXT NOT NULL,
       query_key TEXT NOT NULL,
       query TEXT NOT NULL,
-      condition TEXT NOT NULL DEFAULT 'new',
       old_price NUMERIC NOT NULL,
       new_price NUMERIC NOT NULL,
       currency TEXT NOT NULL DEFAULT 'GBP',
@@ -98,23 +74,34 @@ async function initDb() {
     );
   `);
 
-  console.log("✅ DB ready");
+  /* ===== FIX FOR YOUR ERROR ===== */
+  await pool.query(`
+    ALTER TABLE price_drops
+    ADD COLUMN IF NOT EXISTS condition TEXT NOT NULL DEFAULT 'new';
+  `);
+
+  console.log("✅ Database ready");
 }
 
-// --------------------
-// Health
-// --------------------
+/* ===============================
+   HEALTH
+================================ */
+
 app.get("/", (_req, res) => {
   res.json({ ok: true, service: "fndit-backend" });
 });
 
-// --------------------
-// Tracking
-// --------------------
+/* ===============================
+   TRACK SEARCH
+================================ */
+
 app.post("/track", async (req, res) => {
   try {
-    const { deviceId, query, condition } = req.body || {};
-    if (!deviceId || !query) return res.status(400).json({ error: "Missing deviceId or query" });
+    const { deviceId, query, condition } = req.body;
+
+    if (!deviceId || !query) {
+      return res.status(400).json({ error: "Missing deviceId or query" });
+    }
 
     const queryKey = normalizeQueryKey(query);
     const cond = normalizeCondition(condition);
@@ -122,7 +109,7 @@ app.post("/track", async (req, res) => {
     await pool.query(
       `
       INSERT INTO tracked_searches (device_id, query, query_key, condition)
-      VALUES ($1, $2, $3, $4)
+      VALUES ($1,$2,$3,$4)
       ON CONFLICT (device_id, query_key, condition)
       DO UPDATE SET query = EXCLUDED.query
       `,
@@ -135,16 +122,22 @@ app.post("/track", async (req, res) => {
   }
 });
 
+/* ===============================
+   UNTRACK
+================================ */
+
 app.post("/untrack", async (req, res) => {
   try {
-    const { deviceId, query, condition } = req.body || {};
-    if (!deviceId || !query) return res.status(400).json({ error: "Missing deviceId or query" });
+    const { deviceId, query, condition } = req.body;
 
     const queryKey = normalizeQueryKey(query);
     const cond = normalizeCondition(condition);
 
     await pool.query(
-      `DELETE FROM tracked_searches WHERE device_id=$1 AND query_key=$2 AND condition=$3`,
+      `
+      DELETE FROM tracked_searches
+      WHERE device_id=$1 AND query_key=$2 AND condition=$3
+      `,
       [deviceId, queryKey, cond]
     );
 
@@ -154,14 +147,17 @@ app.post("/untrack", async (req, res) => {
   }
 });
 
+/* ===============================
+   GET TRACKED SEARCHES
+================================ */
+
 app.get("/tracked", async (req, res) => {
   try {
-    const deviceId = (req.query.deviceId || "").toString().trim();
-    if (!deviceId) return res.status(400).json({ error: "Missing deviceId" });
+    const deviceId = req.query.deviceId;
 
     const r = await pool.query(
       `
-      SELECT query, condition, last_price, last_seen_at, created_at
+      SELECT query, condition, last_price, last_seen_at
       FROM tracked_searches
       WHERE device_id=$1
       ORDER BY created_at DESC
@@ -175,455 +171,71 @@ app.get("/tracked", async (req, res) => {
   }
 });
 
-app.get("/drops", async (req, res) => {
-  try {
-    const deviceId = (req.query.deviceId || "").toString().trim();
-    if (!deviceId) return res.status(400).json({ error: "Missing deviceId" });
+/* ===============================
+   SEARCH
+================================ */
 
-    const r = await pool.query(
-      `
-      SELECT query, condition, old_price, new_price, currency, detected_at
-      FROM price_drops
-      WHERE device_id=$1
-      ORDER BY detected_at DESC
-      LIMIT 50
-      `,
-      [deviceId]
-    );
-
-    res.json({ ok: true, drops: r.rows });
-  } catch (e) {
-    res.status(500).json({ error: "Drops fetch failed", detail: String(e) });
-  }
-});
-
-// --------------------
-// Search: Accuracy + Best Deal + Query Expansion
-// --------------------
-
-// Stopwords: remove common/low-signal terms from token set
-const STOPWORDS = new Set([
-  "the","a","an","and","or","for","with","without","to","of","in","on","at","by",
-  "new","brand","original","genuine","authentic",
-  "size","uk","us","eu","mens","men","men's","womens","women","women's","kids","kid","child","children",
-  "pack","set","bundle"
-]);
-
-function tokenizeQuery(q) {
-  const norm = normalizeText(q);
-  const raw = norm.split(" ").filter(Boolean);
-  const tokens = raw.filter(t => t.length >= 2 && !STOPWORDS.has(t));
-  return Array.from(new Set(tokens));
-}
-
-// Intent detection (used for negative filters)
-function looksLikeFootwear(q) {
-  const s = normalizeText(q);
-  const keys = ["shoe","shoes","trainer","trainers","sneaker","sneakers","boot","boots","air max","airmax","air force","airforce","jordan","dunk","samba","gazelle"];
-  return keys.some(k => s.includes(k));
-}
-function looksLikeClothing(q) {
-  const s = normalizeText(q);
-  const keys = ["hoodie","tshirt","t-shirt","tee","shirt","polo","jacket","coat","jumper","sweater","tracksuit","jeans","trousers","pants","shorts","leggings","dress","skirt","top"];
-  return keys.some(k => s.includes(k));
-}
-function getIntent(q) {
-  if (looksLikeFootwear(q)) return "footwear";
-  if (looksLikeClothing(q)) return "clothing";
-  return "general";
-}
-
-// Negative filters (avoid accessories / irrelevant)
-const NEGATIVE_COMMON = [
-  "phone case","case for","cover","screen protector","tempered glass","camera lens",
-  "sticker","skin","strap","lanyard","keychain","key ring","holder","stand"
-];
-const NEGATIVE_FOOTWEAR = [
-  "laces","lace","insole","insoles","shoe cleaner","cleaner","protector spray","spray",
-  "sock","socks","shoe bag","bag","replacement","repair","kit","insert"
-];
-const NEGATIVE_CLOTHING = [
-  "hanger","washing","laundry","detergent","patch","iron on","button","zipper","zip","thread"
-];
-
-function containsNegative(title, list) {
-  const t = normalizeText(title);
-  return list.some(neg => t.includes(neg));
-}
-
-function passesNegativeFilter(item, intent) {
-  const title = item.title || "";
-  if (containsNegative(title, NEGATIVE_COMMON)) return false;
-  if (intent === "footwear" && containsNegative(title, NEGATIVE_FOOTWEAR)) return false;
-  if (intent === "clothing" && containsNegative(title, NEGATIVE_CLOTHING)) return false;
-  return true;
-}
-
-// Condition inference (Google Shopping sometimes supplies second_hand_condition)
-function isUsedLike(item) {
-  const s = `${item.secondHand || ""} ${item.title || ""}`.toLowerCase();
-  return (
-    s.includes("used") ||
-    s.includes("pre-owned") ||
-    s.includes("preowned") ||
-    s.includes("second hand") ||
-    s.includes("secondhand") ||
-    s.includes("refurb") ||
-    s.includes("refurbished") ||
-    s.includes("renewed") ||
-    s.includes("open box") ||
-    s.includes("open-box")
-  );
-}
-
-function filterByCondition(items, condition) {
-  const cond = normalizeCondition(condition);
-  if (cond === "any") return items;
-  if (cond === "used") return items.filter(isUsedLike);
-  return items.filter(x => !isUsedLike(x));
-}
-
-// Trusted store boost
-const TRUSTED_STORE_KEYWORDS = [
-  "nike","adidas","jd","jdsports","foot locker","footlocker","pro direct","prodirect",
-  "decathlon","sports direct","amazon","argos","john lewis","selfridges","house of fraser"
-];
-
-function storeTrustScore(storeName) {
-  const s = (storeName || "").toLowerCase();
-  if (!s) return 0;
-  return TRUSTED_STORE_KEYWORDS.some(k => s.includes(k)) ? 6 : 0;
-}
-
-// Scoring
-function scoreItem(itemTitle, itemStore, query, tokens) {
-  const title = normalizeText(itemTitle);
-  if (!title) return -999;
-
-  let score = 0;
-  const qNorm = normalizeText(query);
-
-  for (const tok of tokens) {
-    if (title.includes(tok)) score += 3;
-  }
-
-  const modelNumbers = qNorm.match(/\b\d{2,4}\b/g) || [];
-  for (const n of modelNumbers) {
-    if (title.includes(n)) score += 8;
-    else score -= 4;
-  }
-
-  if ((qNorm.includes("air max") || qNorm.includes("airmax")) &&
-      (title.includes("air max") || title.includes("airmax"))) {
-    score += 8;
-  }
-
-  const qMen = qNorm.includes(" men") || qNorm.includes(" mens") || qNorm.includes("men ") || qNorm.includes("mens");
-  const qWomen = qNorm.includes(" women") || qNorm.includes(" womens") || qNorm.includes("women ") || qNorm.includes("womens");
-
-  if (qMen) {
-    if (title.includes("women") || title.includes("womens") || title.includes("kid") || title.includes("kids")) score -= 8;
-  }
-  if (qWomen) {
-    if (title.includes("men") || title.includes("mens") || title.includes("kid") || title.includes("kids")) score -= 8;
-  }
-
-  score += storeTrustScore(itemStore);
-
-  if (title.length < 12) score -= 2;
-
-  return score;
-}
-
-// Require core token overlap BEFORE ranking
-function coreTokenGate(items, query) {
-  const tokens = tokenizeQuery(query);
-  if (tokens.length === 0) return items;
-
-  const required = Math.min(3, Math.max(1, Math.ceil(tokens.length * 0.5)));
-
-  return items.filter(it => {
-    const title = normalizeText(it.title);
-    if (!title) return false;
-    let hits = 0;
-    for (const t of tokens) {
-      if (title.includes(t)) hits += 1;
-    }
-    return hits >= required;
-  });
-}
-
-function rankAndPickTop3(items, query) {
-  const tokens = tokenizeQuery(query);
-  const gated = coreTokenGate(items, query);
-
-  return gated
-    .map(it => ({ ...it, _score: scoreItem(it.title, it.store, query, tokens) }))
-    .sort((a, b) => {
-      if (b._score !== a._score) return b._score - a._score;
-      return a.price - b.price;
-    })
-    .slice(0, 3)
-    .map(({ _score, ...rest }) => rest);
-}
-
-function median(values) {
-  if (!values.length) return null;
-  const sorted = [...values].sort((a, b) => a - b);
-  const mid = Math.floor(sorted.length / 2);
-  return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
-}
-
-function annotateBestDeal(top3, poolItems) {
-  if (!top3 || top3.length === 0) return top3;
-
-  const pool = (poolItems || []).slice(0, 20);
-  const prices = pool
-    .map(r => safeNumber(r.price))
-    .filter(p => Number.isFinite(p) && p > 0);
-
-  const med = median(prices);
-  if (!Number.isFinite(med) || med <= 0) {
-    return top3.map(r => ({ ...r, isBestDeal: false, savingsVsMedian: 0, savingsPctVsMedian: 0 }));
-  }
-
-  const cheapestIndex = top3.reduce(
-    (bestIdx, r, i) => (Number(r.price) < Number(top3[bestIdx].price) ? i : bestIdx),
-    0
-  );
-
-  const cheapest = top3[cheapestIndex];
-  const savings = +(med - Number(cheapest.price)).toFixed(2);
-  const savingsPct = +(((med - Number(cheapest.price)) / med) * 100).toFixed(0);
-
-  const isBest = (savingsPct >= 10) || (savings >= 10);
-
-  return top3.map((r, i) => ({
-    ...r,
-    isBestDeal: isBest && i === cheapestIndex,
-    savingsVsMedian: isBest && i === cheapestIndex ? Math.max(0, savings) : 0,
-    savingsPctVsMedian: isBest && i === cheapestIndex ? Math.max(0, savingsPct) : 0,
-  }));
-}
-
-// --------------------
-// Query expansion (the new feature)
-// --------------------
-function hasBrandOrModelSignal(q) {
-  const s = normalizeText(q);
-  // if query already has clear brand/model intent, expand less
-  const brandWords = ["nike","adidas","puma","new balance","nb","asics","reebok","under armour","north face","the north face","jordan"];
-  return brandWords.some(b => s.includes(b)) || /\b\d{2,4}\b/.test(s);
-}
-
-function extractSizeHints(q) {
-  // Try to preserve sizing hints user typed (UK size or clothing size)
-  const s = normalizeText(q);
-  const hints = [];
-
-  // UK shoe size like "size 9 uk" or "9 uk"
-  const uk = s.match(/\b(size\s*)?(\d{1,2}(\.\d)?)\s*uk\b/);
-  if (uk?.[2]) hints.push(`size ${uk[2]} uk`);
-
-  // Clothing sizes XS/S/M/L/XL/XXL
-  const cloth = s.match(/\b(xs|s|m|l|xl|xxl)\b/);
-  if (cloth?.[1]) hints.push(`size ${cloth[1].toUpperCase()}`);
-
-  // gender words
-  if (s.includes("men") || s.includes("mens")) hints.push("men");
-  if (s.includes("women") || s.includes("womens")) hints.push("women");
-  if (s.includes("kids") || s.includes("kid") || s.includes("children")) hints.push("kids");
-
-  return Array.from(new Set(hints));
-}
-
-function expandQueries(original, intent) {
-  const q = original.trim();
-  const s = normalizeText(q);
-  const sizeHints = extractSizeHints(q);
-
-  // base always included
-  const out = [q];
-
-  // If already very specific, we keep expansions minimal.
-  const strongSignal = hasBrandOrModelSignal(q);
-
-  const add = (x) => {
-    const v = x.trim();
-    if (!v) return;
-    if (!out.some(o => normalizeQueryKey(o) === normalizeQueryKey(v))) out.push(v);
-  };
-
-  // Add intent words for better shopping results
-  if (intent === "footwear") {
-    add(`${q} trainers`);
-    add(`${q} shoes`);
-    if (!strongSignal) add(`${q} mens trainers`);
-  } else if (intent === "clothing") {
-    add(`${q} jacket`);
-    add(`${q} hoodie`);
-    if (!strongSignal) add(`${q} mens`);
-  } else {
-    // general items
-    add(`${q} price`);
-    add(`${q} buy`);
-  }
-
-  // If the user included size/gender hints, ensure expansions keep them
-  if (sizeHints.length) {
-    const hintString = sizeHints.join(" ");
-    // Attach hints to base query and one expansion
-    add(`${q} ${hintString}`);
-    if (intent === "footwear") add(`${q} trainers ${hintString}`);
-    if (intent === "clothing") add(`${q} ${hintString}`);
-  }
-
-  // Limit to 4 total (keeps SerpApi cost predictable)
-  return out.slice(0, 4);
-}
-
-// --------------------
-// SerpApi Google Shopping fetch
-// --------------------
-async function fetchGoogleShopping(q, country) {
-  if (!SERPAPI_KEY) throw new Error("Missing SERPAPI_KEY");
-
-  const gl = country === "GB" ? "gb" : "us";
+async function fetchGoogleShopping(q) {
   const url = new URL("https://serpapi.com/search.json");
+
   url.searchParams.set("engine", "google_shopping");
   url.searchParams.set("q", q);
-  url.searchParams.set("gl", gl);
+  url.searchParams.set("gl", "gb");
   url.searchParams.set("hl", "en");
   url.searchParams.set("api_key", SERPAPI_KEY);
 
   const r = await fetch(url);
-  if (!r.ok) {
-    const text = await r.text();
-    throw new Error(`SerpApi error: ${r.status} ${text}`);
-  }
 
   const data = await r.json();
 
   return (data.shopping_results || [])
-    .map(it => {
+    .map((it) => {
       const price = safeNumber(it.extracted_price);
-      if (price === null) return null;
 
-      const link = it.product_link || it.link || "";
-      if (!link) return null;
+      if (!price) return null;
 
       return {
         title: it.title || "Item",
         store: it.source || "Google Shopping",
         price,
         currency: "GBP",
-        url: link,
-        secondHand: it.second_hand_condition || "",
-        source: "google",
+        url: it.link || it.product_link || "",
       };
     })
     .filter(Boolean);
 }
 
-function dedupeResults(items) {
-  const seen = new Set();
-  const out = [];
-
-  for (const it of items) {
-    const urlKey = (it.url || "").toString().trim().toLowerCase();
-    const titleKey = normalizeText(it.title);
-    const storeKey = normalizeText(it.store);
-
-    const key = urlKey || `${titleKey}__${storeKey}__${it.price}`;
-    if (seen.has(key)) continue;
-
-    seen.add(key);
-    out.push(it);
-  }
-
-  return out;
-}
-
-// Unified search used by /search and price checker
-async function runSearch({ q, country = "GB", store = "Any", condition = "new" }) {
-  const intent = getIntent(q);
-
-  // Build query expansions
-  const queries = expandQueries(q, intent);
-
-  // Fetch all in parallel (max 4)
-  const batches = await Promise.all(
-    queries.map(async (qq) => {
-      try {
-        const items = await fetchGoogleShopping(qq, country);
-        // keep original query used for debugging optionally
-        return items.map(x => ({ ...x, _fromQuery: qq }));
-      } catch (e) {
-        // If one expansion fails, don’t kill the whole request
-        return [];
-      }
-    })
-  );
-
-  let items = dedupeResults(batches.flat());
-
-  // Negative filters + condition filter
-  items = items.filter(it => passesNegativeFilter(it, intent));
-  items = filterByCondition(items, condition);
-
-  // Optional store filter (string contains match)
-  if (store && store.toLowerCase() !== "any") {
-    const s = store.toLowerCase();
-    items = items.filter(x => (x.store || "").toLowerCase().includes(s));
-  }
-
-  // Pool for median stats (take 20 cheapest after filtering)
-  const poolForStats = [...items].sort((a, b) => a.price - b.price).slice(0, 20);
-
-  // Rank with the ORIGINAL user query (not expansion query)
-  const top3 = rankAndPickTop3(items, q);
-  const annotated = annotateBestDeal(top3, poolForStats);
-
-  return {
-    intent,
-    expandedQueries: queries, // useful for debugging; you can remove later
-    results: annotated,
-  };
-}
-
-/**
- * GET /search?q=...&country=GB&store=Any&condition=new|used|any
- */
 app.get("/search", async (req, res) => {
   try {
     const q = (req.query.q || "").toString().trim();
-    const country = (req.query.country || "GB").toString().trim().toUpperCase();
-    const store = (req.query.store || "Any").toString().trim();
-    const condition = normalizeCondition(req.query.condition || "new");
+    const condition = normalizeCondition(req.query.condition);
 
     if (!q) return res.status(400).json({ error: "Missing q" });
 
-    const out = await runSearch({ q, country, store, condition });
+    const results = await fetchGoogleShopping(q);
+
+    const sorted = results
+      .sort((a, b) => a.price - b.price)
+      .slice(0, 3);
+
     res.json({
       query: q,
-      store,
       condition,
-      intent: out.intent,
-      results: out.results,
-      // Keep for now (debug). Remove later if you want cleaner response:
-      expandedQueries: out.expandedQueries,
+      results: sorted,
     });
   } catch (e) {
     res.status(500).json({ error: "Server error", detail: String(e) });
   }
 });
 
-// --------------------
-// Price checker (manual trigger) — condition-aware
-// --------------------
+/* ===============================
+   PRICE CHECKER
+================================ */
+
 app.get("/run-price-check", async (req, res) => {
   try {
-    const secret = (req.query.secret || "").toString();
+    const secret = req.query.secret;
+
     if (!CHECK_SECRET || secret !== CHECK_SECRET) {
       return res.status(401).json({ error: "Unauthorized" });
     }
@@ -631,7 +243,6 @@ app.get("/run-price-check", async (req, res) => {
     const r = await pool.query(`
       SELECT device_id, query, query_key, condition, last_price
       FROM tracked_searches
-      ORDER BY created_at ASC
     `);
 
     let checked = 0;
@@ -642,58 +253,44 @@ app.get("/run-price-check", async (req, res) => {
       const deviceId = row.device_id;
       const query = row.query;
       const queryKey = row.query_key;
-      const condition = normalizeCondition(row.condition || "new");
-      const oldPrice = row.last_price === null ? null : Number(row.last_price);
+      const condition = row.condition;
+      const oldPrice = Number(row.last_price);
 
-      const out = await runSearch({
-        q: query,
-        country: "GB",
-        store: "Any",
-        condition,
-      });
+      const results = await fetchGoogleShopping(query);
 
-      const cheapest = out.results?.length ? out.results[0] : null;
-      const newPrice = cheapest ? Number(cheapest.price) : null;
+      const cheapest = results.sort((a, b) => a.price - b.price)[0];
 
-      checked += 1;
+      if (!cheapest) continue;
 
-      if (newPrice === null || !Number.isFinite(newPrice)) {
+      const newPrice = cheapest.price;
+
+      checked++;
+
+      if (!oldPrice || newPrice < oldPrice) {
+        if (oldPrice) {
+          await pool.query(
+            `
+            INSERT INTO price_drops
+            (device_id, query_key, query, condition, old_price, new_price)
+            VALUES ($1,$2,$3,$4,$5,$6)
+            `,
+            [deviceId, queryKey, query, condition, oldPrice, newPrice]
+          );
+
+          drops++;
+        }
+
         await pool.query(
-          `UPDATE tracked_searches
-           SET last_seen_at = NOW()
-           WHERE device_id=$1 AND query_key=$2 AND condition=$3`,
-          [deviceId, queryKey, condition]
-        );
-        continue;
-      }
-
-      if (oldPrice === null || !Number.isFinite(oldPrice)) {
-        await pool.query(
-          `UPDATE tracked_searches
-           SET last_price=$1, last_seen_at=NOW()
-           WHERE device_id=$2 AND query_key=$3 AND condition=$4`,
+          `
+          UPDATE tracked_searches
+          SET last_price=$1,last_seen_at=NOW()
+          WHERE device_id=$2 AND query_key=$3 AND condition=$4
+          `,
           [newPrice, deviceId, queryKey, condition]
         );
-        updated += 1;
-        continue;
-      }
 
-      if (newPrice < oldPrice) {
-        await pool.query(
-          `INSERT INTO price_drops (device_id, query_key, query, condition, old_price, new_price, currency)
-           VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-          [deviceId, queryKey, query, condition, oldPrice, newPrice, cheapest.currency || "GBP"]
-        );
-        drops += 1;
+        updated++;
       }
-
-      await pool.query(
-        `UPDATE tracked_searches
-         SET last_price=$1, last_seen_at=NOW()
-         WHERE device_id=$2 AND query_key=$3 AND condition=$4`,
-        [newPrice, deviceId, queryKey, condition]
-      );
-      updated += 1;
     }
 
     res.json({ ok: true, checked, updated, drops });
@@ -702,14 +299,17 @@ app.get("/run-price-check", async (req, res) => {
   }
 });
 
-// --------------------
-// Start
-// --------------------
+/* ===============================
+   START SERVER
+================================ */
+
 initDb()
   .then(() => {
-    app.listen(PORT, () => console.log(`FNDiT backend listening on ${PORT}`));
+    app.listen(PORT, () => {
+      console.log(`FNDiT backend running on port ${PORT}`);
+    });
   })
   .catch((e) => {
-    console.error("❌ DB init failed:", e);
+    console.error("DB init failed", e);
     process.exit(1);
   });
