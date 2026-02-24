@@ -1,4 +1,4 @@
- import express from "express";
+import express from "express";
 import pg from "pg";
 
 const app = express();
@@ -18,9 +18,9 @@ const pool = new Pool({
 
 app.use(express.json());
 
-// --------------------
+// =====================
 // Utils
-// --------------------
+// =====================
 function normalizeQueryKey(q) {
   return (q || "").toString().trim().toLowerCase().replace(/\s+/g, " ");
 }
@@ -50,9 +50,9 @@ function uniq(arr) {
   return Array.from(new Set(arr));
 }
 
-// --------------------
+// =====================
 // DB init + migrations
-// --------------------
+// =====================
 async function initDb() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS tracked_searches (
@@ -85,7 +85,7 @@ async function initDb() {
     );
   `);
 
-  // ✅ Migration fix (older DBs)
+  // ✅ Migration for older DBs
   await pool.query(`
     ALTER TABLE price_drops
     ADD COLUMN IF NOT EXISTS condition TEXT NOT NULL DEFAULT 'new';
@@ -94,21 +94,22 @@ async function initDb() {
   console.log("✅ Database ready");
 }
 
-// --------------------
+// =====================
 // Health
-// --------------------
+// =====================
 app.get("/", (_req, res) => {
   res.json({ ok: true, service: "fndit-backend" });
 });
 
-// --------------------
+// =====================
 // Track / Untrack / Tracked
-// --------------------
+// =====================
 app.post("/track", async (req, res) => {
   try {
     const { deviceId, query, condition } = req.body || {};
-    if (!deviceId || !query)
+    if (!deviceId || !query) {
       return res.status(400).json({ error: "Missing deviceId or query" });
+    }
 
     const queryKey = normalizeQueryKey(query);
     const cond = normalizeCondition(condition);
@@ -132,8 +133,9 @@ app.post("/track", async (req, res) => {
 app.post("/untrack", async (req, res) => {
   try {
     const { deviceId, query, condition } = req.body || {};
-    if (!deviceId || !query)
+    if (!deviceId || !query) {
       return res.status(400).json({ error: "Missing deviceId or query" });
+    }
 
     const queryKey = normalizeQueryKey(query);
     const cond = normalizeCondition(condition);
@@ -170,9 +172,31 @@ app.get("/tracked", async (req, res) => {
   }
 });
 
-// --------------------
+app.get("/drops", async (req, res) => {
+  try {
+    const deviceId = (req.query.deviceId || "").toString().trim();
+    if (!deviceId) return res.status(400).json({ error: "Missing deviceId" });
+
+    const r = await pool.query(
+      `
+      SELECT query, condition, old_price, new_price, currency, detected_at
+      FROM price_drops
+      WHERE device_id=$1
+      ORDER BY detected_at DESC
+      LIMIT 50
+      `,
+      [deviceId]
+    );
+
+    res.json({ ok: true, drops: r.rows });
+  } catch (e) {
+    res.status(500).json({ error: "Drops fetch failed", detail: String(e) });
+  }
+});
+
+// =====================
 // Exact-match accuracy layer
-// --------------------
+// =====================
 
 // Brand dictionary (expand anytime)
 const BRAND_ALIASES = [
@@ -190,6 +214,7 @@ const BRAND_ALIASES = [
 
 // Aggressive accessory blocklist
 const ACCESSORY_BLOCKLIST = [
+  // universal junk
   "phone case",
   "case for",
   "iphone case",
@@ -207,6 +232,7 @@ const ACCESSORY_BLOCKLIST = [
   "keychain",
   "key ring",
   "lanyard",
+  // footwear accessories
   "laces",
   "lace",
   "insole",
@@ -223,6 +249,7 @@ const ACCESSORY_BLOCKLIST = [
   "replacement",
   "repair",
   "insert",
+  // clothing accessories
   "hanger",
   "patch",
   "iron on",
@@ -232,6 +259,32 @@ const ACCESSORY_BLOCKLIST = [
   "zip",
   "thread",
 ];
+
+// Kids/generalized terms (boys/girls/infant/etc.)
+const KIDS_TERMS = [
+  "kid",
+  "kids",
+  "child",
+  "children",
+  "boy",
+  "boys",
+  "girl",
+  "girls",
+  "infant",
+  "newborn",
+  "toddler",
+  "baby",
+  "babies",
+  "youth",
+  "junior",
+  "jr",
+  "school",
+  "schoolwear",
+  "school wear",
+];
+
+const MEN_TERMS = ["men", "mens", "man's", "male"];
+const WOMEN_TERMS = ["women", "womens", "woman", "female", "ladies", "lady"];
 
 function containsAny(text, phrases) {
   const t = normText(text);
@@ -251,6 +304,23 @@ function extractModelNumbers(q) {
   const t = normText(q);
   const nums = t.match(/\b\d{2,4}\b/g) || [];
   return uniq(nums);
+}
+
+function detectGenderIntent(q) {
+  const t = normText(q);
+
+  const hasKids = KIDS_TERMS.some((k) => t.includes(k));
+  const hasMen = MEN_TERMS.some((k) => t.includes(k));
+  const hasWomen = WOMEN_TERMS.some((k) => t.includes(k));
+
+  // Explicit men/women wins
+  if (hasMen) return "men";
+  if (hasWomen) return "women";
+
+  // Otherwise, if it looks like kids
+  if (hasKids) return "kids";
+
+  return "any";
 }
 
 const STOPWORDS = new Set([
@@ -277,16 +347,6 @@ const STOPWORDS = new Set([
   "uk",
   "us",
   "eu",
-  "mens",
-  "men",
-  "men's",
-  "womens",
-  "women",
-  "women's",
-  "kids",
-  "kid",
-  "child",
-  "children",
   "pack",
   "set",
   "bundle",
@@ -302,7 +362,7 @@ function tokenize(q) {
   );
 }
 
-function confidenceScore(itemTitle, itemStore, qTokens, qBrands, qModels) {
+function confidenceScore(itemTitle, itemStore, qTokens, qBrands, qModels, genderIntent) {
   const title = normText(itemTitle);
   const store = normText(itemStore);
 
@@ -315,14 +375,33 @@ function confidenceScore(itemTitle, itemStore, qTokens, qBrands, qModels) {
 
   // Brand boost
   for (const b of qBrands) {
-    if (title.includes(normText(b))) score += 10;
-    else if (store.includes(normText(b))) score += 6;
+    const bb = normText(b);
+    if (title.includes(bb)) score += 12;
+    else if (store.includes(bb)) score += 7;
   }
 
   // Model number boost + penalty
   for (const m of qModels) {
-    if (title.includes(m)) score += 12;
-    else score -= 8;
+    if (title.includes(m)) score += 14;
+    else score -= 10;
+  }
+
+  // Gender boost/penalty (soft scoring; hard gating happens separately)
+  const isKids = KIDS_TERMS.some((k) => title.includes(k));
+  const isMen = MEN_TERMS.some((k) => title.includes(k));
+  const isWomen = WOMEN_TERMS.some((k) => title.includes(k));
+
+  if (genderIntent === "men") {
+    if (isMen) score += 6;
+    if (isWomen) score -= 10;
+    if (isKids) score -= 12;
+  } else if (genderIntent === "women") {
+    if (isWomen) score += 6;
+    if (isMen) score -= 10;
+    if (isKids) score -= 12;
+  } else if (genderIntent === "kids") {
+    if (isKids) score += 6;
+    if (isMen || isWomen) score -= 8;
   }
 
   // Penalize very short titles
@@ -331,8 +410,8 @@ function confidenceScore(itemTitle, itemStore, qTokens, qBrands, qModels) {
   return score;
 }
 
-// HARD GATES: exact-match enforcement
-function applyHardGates(items, qBrands, qModels) {
+// HARD GATES: exact enforcement (brand/model/gender + accessory block)
+function applyHardGates(items, qBrands, qModels, genderIntent) {
   return items.filter((it) => {
     const title = normText(it.title);
     const store = normText(it.store);
@@ -342,9 +421,10 @@ function applyHardGates(items, qBrands, qModels) {
 
     // brand lock
     if (qBrands.length) {
-      const okBrand = qBrands.some(
-        (b) => title.includes(normText(b)) || store.includes(normText(b))
-      );
+      const okBrand = qBrands.some((b) => {
+        const bb = normText(b);
+        return title.includes(bb) || store.includes(bb);
+      });
       if (!okBrand) return false;
     }
 
@@ -352,6 +432,23 @@ function applyHardGates(items, qBrands, qModels) {
     if (qModels.length) {
       const okModel = qModels.some((m) => title.includes(m));
       if (!okModel) return false;
+    }
+
+    // gender lock
+    const isKids = KIDS_TERMS.some((k) => title.includes(k));
+    const isMen = MEN_TERMS.some((k) => title.includes(k));
+    const isWomen = WOMEN_TERMS.some((k) => title.includes(k));
+
+    if (genderIntent === "men") {
+      if (isKids) return false;
+      if (isWomen) return false;
+    } else if (genderIntent === "women") {
+      if (isKids) return false;
+      if (isMen) return false;
+    } else if (genderIntent === "kids") {
+      // allow boys/girls/infant/newborn/etc
+      if (isMen) return false;
+      if (isWomen) return false;
     }
 
     return true;
@@ -438,12 +535,11 @@ function annotateBestDeal(top3, poolItems) {
   }));
 }
 
-// --------------------
-// Query expansion (light)
-// --------------------
+// =====================
+// Query expansion (light + cheap)
+// =====================
 function shouldExpandQuery(q, brands, models) {
   const tokens = tokenize(q);
-  // Expand only if query is short-ish
   if (brands.length || models.length) return tokens.length <= 5;
   return tokens.length <= 4;
 }
@@ -460,19 +556,19 @@ function expandQueries(q) {
   };
 
   add(`${base} buy`);
-  add(`${base} price`);
   add(`${base} online`);
 
   return out.slice(0, 3);
 }
 
-// --------------------
-// SerpApi fetch
-// --------------------
+// =====================
+// SerpApi fetch (Google Shopping)
+// =====================
 async function fetchGoogleShopping(q, country = "GB") {
   if (!SERPAPI_KEY) throw new Error("Missing SERPAPI_KEY");
 
   const gl = country === "GB" ? "gb" : "us";
+
   const url = new URL("https://serpapi.com/search.json");
   url.searchParams.set("engine", "google_shopping");
   url.searchParams.set("q", q);
@@ -508,13 +604,14 @@ async function fetchGoogleShopping(q, country = "GB") {
     .filter(Boolean);
 }
 
-// --------------------
+// =====================
 // Core search (EXACT MATCH MODE)
-// --------------------
+// =====================
 async function runSearch({ q, country = "GB", store = "Any", condition = "new" }) {
   const qBrands = detectBrands(q);
   const qModels = extractModelNumbers(q);
   const qTokens = tokenize(q);
+  const genderIntent = detectGenderIntent(q);
 
   const queries = shouldExpandQuery(q, qBrands, qModels) ? expandQueries(q) : [q];
 
@@ -539,42 +636,38 @@ async function runSearch({ q, country = "GB", store = "Any", condition = "new" }
   // Condition filter
   items = filterByCondition(items, condition);
 
-  // HARD GATES
-  items = applyHardGates(items, qBrands, qModels);
+  // HARD GATES (brand/model/gender/accessories)
+  items = applyHardGates(items, qBrands, qModels, genderIntent);
 
   // Score
   const scored = items
     .map((it) => ({
       ...it,
-      _score: confidenceScore(it.title, it.store, qTokens, qBrands, qModels),
+      _score: confidenceScore(it.title, it.store, qTokens, qBrands, qModels, genderIntent),
     }))
     .sort((a, b) => {
       if (b._score !== a._score) return b._score - a._score;
       return a.price - b.price;
     });
 
-  // ✅ EXACT MODE: strict threshold + NO fallback
+  // ✅ Exact mode: strict threshold, no fallback
   const MIN_SCORE = qBrands.length || qModels.length ? 22 : 16;
   const confident = scored.filter((x) => x._score >= MIN_SCORE);
 
-  const finalPool = confident; // 👈 no fallback
+  const finalPool = confident;
 
-  const poolForStats = [...finalPool]
-    .slice(0, 20)
-    .sort((a, b) => a.price - b.price);
+  const poolForStats = [...finalPool].slice(0, 20).sort((a, b) => a.price - b.price);
 
-  const top3 = finalPool
-    .slice(0, 3)
-    .map(({ _score, ...rest }) => rest);
+  const top3 = finalPool.slice(0, 3).map(({ _score, ...rest }) => rest);
 
   const annotated = annotateBestDeal(top3, poolForStats);
 
   return { results: annotated };
 }
 
-// --------------------
+// =====================
 // Routes
-// --------------------
+// =====================
 app.get("/search", async (req, res) => {
   try {
     const q = (req.query.q || "").toString().trim();
@@ -592,31 +685,9 @@ app.get("/search", async (req, res) => {
   }
 });
 
-app.get("/drops", async (req, res) => {
-  try {
-    const deviceId = (req.query.deviceId || "").toString().trim();
-    if (!deviceId) return res.status(400).json({ error: "Missing deviceId" });
-
-    const r = await pool.query(
-      `
-      SELECT query, condition, old_price, new_price, currency, detected_at
-      FROM price_drops
-      WHERE device_id=$1
-      ORDER BY detected_at DESC
-      LIMIT 50
-      `,
-      [deviceId]
-    );
-
-    res.json({ ok: true, drops: r.rows });
-  } catch (e) {
-    res.status(500).json({ error: "Drops fetch failed", detail: String(e) });
-  }
-});
-
-// --------------------
+// =====================
 // Price checker (GitHub Actions)
-// --------------------
+// =====================
 app.get("/run-price-check", async (req, res) => {
   try {
     const secret = (req.query.secret || "").toString();
@@ -696,9 +767,9 @@ app.get("/run-price-check", async (req, res) => {
   }
 });
 
-// --------------------
+// =====================
 // Start
-// --------------------
+// =====================
 initDb()
   .then(() => {
     app.listen(PORT, () => console.log(`FNDiT backend listening on ${PORT}`));
