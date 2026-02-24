@@ -1,4 +1,4 @@
-import express from "express";
+ import express from "express";
 import pg from "pg";
 
 const app = express();
@@ -102,12 +102,13 @@ app.get("/", (_req, res) => {
 });
 
 // --------------------
-// Track / Untrack
+// Track / Untrack / Tracked
 // --------------------
 app.post("/track", async (req, res) => {
   try {
     const { deviceId, query, condition } = req.body || {};
-    if (!deviceId || !query) return res.status(400).json({ error: "Missing deviceId or query" });
+    if (!deviceId || !query)
+      return res.status(400).json({ error: "Missing deviceId or query" });
 
     const queryKey = normalizeQueryKey(query);
     const cond = normalizeCondition(condition);
@@ -131,7 +132,8 @@ app.post("/track", async (req, res) => {
 app.post("/untrack", async (req, res) => {
   try {
     const { deviceId, query, condition } = req.body || {};
-    if (!deviceId || !query) return res.status(400).json({ error: "Missing deviceId or query" });
+    if (!deviceId || !query)
+      return res.status(400).json({ error: "Missing deviceId or query" });
 
     const queryKey = normalizeQueryKey(query);
     const cond = normalizeCondition(condition);
@@ -169,10 +171,10 @@ app.get("/tracked", async (req, res) => {
 });
 
 // --------------------
-// Accuracy: brand + model + accessory blocking
+// Exact-match accuracy layer
 // --------------------
 
-// “Brand dictionary” (expand anytime)
+// Brand dictionary (expand anytime)
 const BRAND_ALIASES = [
   { key: "nike", variants: ["nike"] },
   { key: "adidas", variants: ["adidas"] },
@@ -186,48 +188,118 @@ const BRAND_ALIASES = [
   { key: "the north face", variants: ["the north face", "north face", "tnf"] },
 ];
 
+// Aggressive accessory blocklist
 const ACCESSORY_BLOCKLIST = [
-  // universal junk
-  "phone case","case for","iphone case","samsung case","cover","screen protector","tempered glass",
-  "sticker","skin","wrap","grip","holder","stand","mount","keychain","key ring","lanyard",
-  // footwear accessories
-  "laces","lace","insole","insoles","shoe cleaner","cleaner","protector spray","spray","shoe care","kit",
-  "sock","socks","shoe bag","replacement","repair","insert",
-  // clothing accessories
-  "hanger","patch","iron on","iron-on","button","zipper","zip","thread"
+  "phone case",
+  "case for",
+  "iphone case",
+  "samsung case",
+  "cover",
+  "screen protector",
+  "tempered glass",
+  "sticker",
+  "skin",
+  "wrap",
+  "grip",
+  "holder",
+  "stand",
+  "mount",
+  "keychain",
+  "key ring",
+  "lanyard",
+  "laces",
+  "lace",
+  "insole",
+  "insoles",
+  "shoe cleaner",
+  "cleaner",
+  "protector spray",
+  "spray",
+  "shoe care",
+  "kit",
+  "sock",
+  "socks",
+  "shoe bag",
+  "replacement",
+  "repair",
+  "insert",
+  "hanger",
+  "patch",
+  "iron on",
+  "iron-on",
+  "button",
+  "zipper",
+  "zip",
+  "thread",
 ];
 
 function containsAny(text, phrases) {
   const t = normText(text);
-  return phrases.some(p => t.includes(normText(p)));
+  return phrases.some((p) => t.includes(normText(p)));
 }
 
 function detectBrands(q) {
   const t = normText(q);
   const found = [];
   for (const b of BRAND_ALIASES) {
-    if (b.variants.some(v => t.includes(normText(v)))) found.push(b.key);
+    if (b.variants.some((v) => t.includes(normText(v)))) found.push(b.key);
   }
   return uniq(found);
 }
 
 function extractModelNumbers(q) {
-  // find 2–4 digit numbers: 90, 95, 550, 2002, etc.
   const t = normText(q);
   const nums = t.match(/\b\d{2,4}\b/g) || [];
   return uniq(nums);
 }
 
 const STOPWORDS = new Set([
-  "the","a","an","and","or","for","with","without","to","of","in","on","at","by",
-  "new","brand","original","genuine","authentic",
-  "size","uk","us","eu","mens","men","men's","womens","women","women's","kids","kid","child","children",
-  "pack","set","bundle"
+  "the",
+  "a",
+  "an",
+  "and",
+  "or",
+  "for",
+  "with",
+  "without",
+  "to",
+  "of",
+  "in",
+  "on",
+  "at",
+  "by",
+  "new",
+  "brand",
+  "original",
+  "genuine",
+  "authentic",
+  "size",
+  "uk",
+  "us",
+  "eu",
+  "mens",
+  "men",
+  "men's",
+  "womens",
+  "women",
+  "women's",
+  "kids",
+  "kid",
+  "child",
+  "children",
+  "pack",
+  "set",
+  "bundle",
 ]);
 
 function tokenize(q) {
   const t = normText(q);
-  return uniq(t.split(" ").filter(Boolean).filter(w => w.length >= 2 && !STOPWORDS.has(w)));
+  return uniq(
+    t
+      .split(" ")
+      .filter(Boolean)
+      .filter((w) => w.length >= 2 && !STOPWORDS.has(w))
+  );
 }
 
 function confidenceScore(itemTitle, itemStore, qTokens, qBrands, qModels) {
@@ -241,41 +313,44 @@ function confidenceScore(itemTitle, itemStore, qTokens, qBrands, qModels) {
     if (title.includes(tok)) score += 3;
   }
 
-  // Brand boost + enforcement (enforced separately too)
+  // Brand boost
   for (const b of qBrands) {
     if (title.includes(normText(b))) score += 10;
     else if (store.includes(normText(b))) score += 6;
   }
 
-  // Model number boost
+  // Model number boost + penalty
   for (const m of qModels) {
     if (title.includes(m)) score += 12;
-    else score -= 6; // missing model when user typed one is bad
+    else score -= 8;
   }
 
-  // Penalize suspiciously generic titles
+  // Penalize very short titles
   if (title.length < 12) score -= 4;
 
   return score;
 }
 
+// HARD GATES: exact-match enforcement
 function applyHardGates(items, qBrands, qModels) {
-  return items.filter(it => {
+  return items.filter((it) => {
     const title = normText(it.title);
     const store = normText(it.store);
 
-    // Accessory block
+    // accessory block
     if (containsAny(title, ACCESSORY_BLOCKLIST)) return false;
 
-    // Brand lock: if query has a brand, require at least one brand match (title or store)
+    // brand lock
     if (qBrands.length) {
-      const okBrand = qBrands.some(b => title.includes(normText(b)) || store.includes(normText(b)));
+      const okBrand = qBrands.some(
+        (b) => title.includes(normText(b)) || store.includes(normText(b))
+      );
       if (!okBrand) return false;
     }
 
-    // Model lock: if user typed numbers like 95/90/550, require at least one of them in title
+    // model lock
     if (qModels.length) {
-      const okModel = qModels.some(m => title.includes(m));
+      const okModel = qModels.some((m) => title.includes(m));
       if (!okModel) return false;
     }
 
@@ -304,7 +379,7 @@ function filterByCondition(items, condition) {
   };
 
   if (cond === "used") return items.filter(isUsedLike);
-  return items.filter(x => !isUsedLike(x));
+  return items.filter((x) => !isUsedLike(x));
 }
 
 function dedupe(items) {
@@ -329,20 +404,31 @@ function median(values) {
 
 function annotateBestDeal(top3, poolItems) {
   if (!top3.length) return top3;
-  const pool = (poolItems || []).slice(0, 20);
-  const prices = pool.map(x => safeNumber(x.price)).filter(p => Number.isFinite(p) && p > 0);
-  const med = median(prices);
 
+  const pool = (poolItems || []).slice(0, 20);
+  const prices = pool
+    .map((x) => safeNumber(x.price))
+    .filter((p) => Number.isFinite(p) && p > 0);
+
+  const med = median(prices);
   if (!Number.isFinite(med) || med <= 0) {
-    return top3.map(r => ({ ...r, isBestDeal: false, savingsVsMedian: 0, savingsPctVsMedian: 0 }));
+    return top3.map((r) => ({
+      ...r,
+      isBestDeal: false,
+      savingsVsMedian: 0,
+      savingsPctVsMedian: 0,
+    }));
   }
 
-  const cheapestIdx = top3.reduce((best, r, i) => (r.price < top3[best].price ? i : best), 0);
+  const cheapestIdx = top3.reduce(
+    (best, r, i) => (r.price < top3[best].price ? i : best),
+    0
+  );
   const cheapest = top3[cheapestIdx];
 
   const savings = +(med - cheapest.price).toFixed(2);
   const savingsPct = +(((med - cheapest.price) / med) * 100).toFixed(0);
-  const isBest = (savingsPct >= 10) || (savings >= 10);
+  const isBest = savingsPct >= 10 || savings >= 10;
 
   return top3.map((r, i) => ({
     ...r,
@@ -353,11 +439,11 @@ function annotateBestDeal(top3, poolItems) {
 }
 
 // --------------------
-// Query expansion (safe + cheaper)
+// Query expansion (light)
 // --------------------
 function shouldExpandQuery(q, brands, models) {
   const tokens = tokenize(q);
-  // Expand only if query is short-ish and not already super specific
+  // Expand only if query is short-ish
   if (brands.length || models.length) return tokens.length <= 5;
   return tokens.length <= 4;
 }
@@ -370,19 +456,18 @@ function expandQueries(q) {
     const v = x.trim();
     if (!v) return;
     const k = normalizeQueryKey(v);
-    if (!out.some(o => normalizeQueryKey(o) === k)) out.push(v);
+    if (!out.some((o) => normalizeQueryKey(o) === k)) out.push(v);
   };
 
-  // light expansions that help Google Shopping
   add(`${base} buy`);
   add(`${base} price`);
   add(`${base} online`);
 
-  return out.slice(0, 3); // keep cheap
+  return out.slice(0, 3);
 }
 
 // --------------------
-// SerpApi fetch (Google Shopping)
+// SerpApi fetch
 // --------------------
 async function fetchGoogleShopping(q, country = "GB") {
   if (!SERPAPI_KEY) throw new Error("Missing SERPAPI_KEY");
@@ -424,7 +509,7 @@ async function fetchGoogleShopping(q, country = "GB") {
 }
 
 // --------------------
-// Core search logic
+// Core search (EXACT MATCH MODE)
 // --------------------
 async function runSearch({ q, country = "GB", store = "Any", condition = "new" }) {
   const qBrands = detectBrands(q);
@@ -448,50 +533,43 @@ async function runSearch({ q, country = "GB", store = "Any", condition = "new" }
   // Store filter (optional)
   if (store && store.toLowerCase() !== "any") {
     const s = store.toLowerCase();
-    items = items.filter(x => (x.store || "").toLowerCase().includes(s));
+    items = items.filter((x) => (x.store || "").toLowerCase().includes(s));
   }
 
   // Condition filter
   items = filterByCondition(items, condition);
 
-  // HARD GATES (brand/model/accessory)
+  // HARD GATES
   items = applyHardGates(items, qBrands, qModels);
 
-  // Score + confidence threshold
+  // Score
   const scored = items
-    .map(it => ({
+    .map((it) => ({
       ...it,
       _score: confidenceScore(it.title, it.store, qTokens, qBrands, qModels),
     }))
     .sort((a, b) => {
-      // higher score first, then cheaper
       if (b._score !== a._score) return b._score - a._score;
       return a.price - b.price;
     });
 
-  // Confidence threshold tuned to be strict but not empty
-  const MIN_SCORE = qBrands.length || qModels.length ? 18 : 12;
-  const confident = scored.filter(x => x._score >= MIN_SCORE);
+  // ✅ EXACT MODE: strict threshold + NO fallback
+  const MIN_SCORE = qBrands.length || qModels.length ? 22 : 16;
+  const confident = scored.filter((x) => x._score >= MIN_SCORE);
 
-  // If confidence is too strict and yields nothing, fall back once (still accessory-blocked)
-  const finalPool = confident.length ? confident : scored;
+  const finalPool = confident; // 👈 no fallback
 
-  const poolForStats = [...finalPool].slice(0, 20).sort((a, b) => a.price - b.price);
+  const poolForStats = [...finalPool]
+    .slice(0, 20)
+    .sort((a, b) => a.price - b.price);
 
   const top3 = finalPool
-    .slice(0, 10)
-    .sort((a, b) => {
-      if (b._score !== a._score) return b._score - a._score;
-      return a.price - b.price;
-    })
     .slice(0, 3)
     .map(({ _score, ...rest }) => rest);
 
   const annotated = annotateBestDeal(top3, poolForStats);
 
-  return {
-    results: annotated,
-  };
+  return { results: annotated };
 }
 
 // --------------------
@@ -508,18 +586,12 @@ app.get("/search", async (req, res) => {
 
     const out = await runSearch({ q, country, store, condition });
 
-    res.json({
-      query: q,
-      store,
-      condition,
-      results: out.results,
-    });
+    res.json({ query: q, store, condition, results: out.results });
   } catch (e) {
     res.status(500).json({ error: "Server error", detail: String(e) });
   }
 });
 
-// Price drops (optional to view)
 app.get("/drops", async (req, res) => {
   try {
     const deviceId = (req.query.deviceId || "").toString().trim();
@@ -612,7 +684,6 @@ app.get("/run-price-check", async (req, res) => {
           [newPrice, deviceId, queryKey, condition]
         );
         updated += 1;
-
       } catch {
         failed += 1;
         checked += 1;
