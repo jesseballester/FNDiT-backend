@@ -72,7 +72,7 @@ const BRANDS = [
   "vans",
   "lego",
   "north face",
-  "the north face"
+  "the north face",
 ];
 
 function detectBrands(q) {
@@ -84,7 +84,7 @@ const IMPLICIT_BRANDS = [
   { pattern: /air max|vapormax|pegasus|cortez/i, brand: "nike" },
   { pattern: /samba|gazelle|ultraboost|stan smith/i, brand: "adidas" },
   { pattern: /\b550\b|\b574\b|\b990\b|\b2002r\b/i, brand: "new balance" },
-  { pattern: /nuptse/i, brand: "the north face" }
+  { pattern: /nuptse/i, brand: "the north face" },
 ];
 
 function detectImplicitBrand(q, brands) {
@@ -106,8 +106,32 @@ function extractModelNumbers(q) {
 
 function tokenize(q) {
   const STOPWORDS = new Set([
-    "the","a","an","and","or","for","with","without","to","of","in","on","at","by",
-    "new","brand","original","genuine","authentic","size","uk","us","eu","pack","set","bundle"
+    "the",
+    "a",
+    "an",
+    "and",
+    "or",
+    "for",
+    "with",
+    "without",
+    "to",
+    "of",
+    "in",
+    "on",
+    "at",
+    "by",
+    "new",
+    "brand",
+    "original",
+    "genuine",
+    "authentic",
+    "size",
+    "uk",
+    "us",
+    "eu",
+    "pack",
+    "set",
+    "bundle",
   ]);
 
   return uniq(
@@ -139,7 +163,9 @@ function looksLikeFootwear(q) {
 function isLegoSetIntent(q) {
   const t = normText(q);
   if (!t.includes("lego")) return false;
-  if (t.includes("minifig") || t.includes("minifigure") || t.includes("figure")) return false;
+  if (t.includes("minifig") || t.includes("minifigure") || t.includes("figure")) {
+    return false;
+  }
   return true;
 }
 
@@ -181,7 +207,7 @@ const ACCESSORY_BLOCKLIST = [
   "iron on",
   "iron-on",
   "zipper",
-  "thread"
+  "thread",
 ];
 
 const LEGO_BLOCK = [
@@ -213,14 +239,28 @@ const LEGO_BLOCK = [
   "light kit",
   "lighting kit",
   "led kit",
-  "led light kit"
+  "led light kit",
 ];
 
-const BLOCKED_STORES = ["aliexpress", "alibaba"];
+const BLOCKED_STORES = ["aliexpress", "alibaba", "ebay"];
 
 const KIDS_TERMS = [
-  "kid", "kids", "child", "children", "boy", "boys", "girl", "girls",
-  "infant", "newborn", "toddler", "baby", "babies", "youth", "junior", "jr"
+  "kid",
+  "kids",
+  "child",
+  "children",
+  "boy",
+  "boys",
+  "girl",
+  "girls",
+  "infant",
+  "newborn",
+  "toddler",
+  "baby",
+  "babies",
+  "youth",
+  "junior",
+  "jr",
 ];
 
 function containsAny(text, phrases) {
@@ -293,7 +333,7 @@ async function fetchGoogleShopping(q, country = "GB") {
       store: it.source || "Store",
       price: safeNumber(it.extracted_price),
       currency: "GBP",
-      url: it.product_link || it.link || ""
+      url: it.product_link || it.link || "",
     }))
     .filter((x) => x.price && x.url);
 }
@@ -309,25 +349,21 @@ function scoreResult(item, q, brands, models) {
 
   let score = 0;
 
-  // token overlap
   tokens.forEach((t) => {
     if (title.includes(t)) score += 3;
   });
 
-  // brand boost
   brands.forEach((b) => {
     const bb = normText(b);
     if (title.includes(bb)) score += 10;
     else if (store.includes(bb)) score += 5;
   });
 
-  // model boost / penalty
   models.forEach((m) => {
     if (title.includes(m)) score += 12;
     else score -= 6;
   });
 
-  // kids penalty for adult searches
   const isKids = KIDS_TERMS.some((k) => title.includes(k));
   if (
     isKids &&
@@ -349,7 +385,7 @@ function dedupe(items) {
   const out = [];
 
   for (const it of items) {
-    const key = (it.url || "").toLowerCase() || `${normText(it.title)}__${it.price}`;
+    const key = `${normText(it.title)}__${normText(it.store)}__${it.price}`;
     if (seen.has(key)) continue;
     seen.add(key);
     out.push(it);
@@ -385,21 +421,16 @@ async function runSearch(q, country = "GB") {
 
   let items = dedupe(batches.flat());
 
-  // Block low-trust stores
   items = items.filter((i) => !isBlockedStore(i.store));
-
-  // Remove general accessories
   items = items.filter((i) => !containsAny(i.title, ACCESSORY_BLOCKLIST));
 
-  // LEGO strict mode
   if (legoMode) {
     items = items.filter((i) => !containsAny(i.title, LEGO_BLOCK));
   }
 
-  // Brand lock first, but allow fallback if it empties everything
-  let brandLocked = items;
+  // Brand lock, but don't kill results if too strict
   if (brands.length) {
-    brandLocked = items.filter((i) =>
+    const brandLocked = items.filter((i) =>
       brands.some((b) => {
         const bb = normText(b);
         return normText(i.title).includes(bb) || normText(i.store).includes(bb);
@@ -408,33 +439,30 @@ async function runSearch(q, country = "GB") {
     if (brandLocked.length > 0) items = brandLocked;
   }
 
-  // Model lock first, but allow fallback if it empties everything
-  let modelLocked = items;
+  // Model lock, but don't kill results if too strict
   if (models.length) {
-    modelLocked = items.filter((i) =>
+    const modelLocked = items.filter((i) =>
       models.some((m) => normText(i.title).includes(m))
     );
     if (modelLocked.length > 0) items = modelLocked;
   }
 
-  // Score + sort
-  let scored = items
+  const scored = items
     .map((i) => ({ ...i, score: scoreResult(i, q, brands, models) }))
     .sort((a, b) => {
       if (b.score !== a.score) return b.score - a.score;
       return a.price - b.price;
     });
 
-  // Strict first
   let filtered = scored.filter((i) => i.score >= (brands.length || models.length ? 12 : 8));
 
-  // ✅ Fallback if too strict
+  // fallback if too strict
   if (filtered.length === 0) {
     filtered = scored.filter((i) => i.score >= 4);
   }
 
   return {
-    results: filtered.slice(0, 3).map(({ score, ...rest }) => rest)
+    results: filtered.slice(0, 3).map(({ score, ...rest }) => rest),
   };
 }
 
@@ -467,12 +495,12 @@ app.get("/search", async (req, res) => {
       query: q,
       store,
       condition,
-      results: out.results
+      results: out.results,
     });
   } catch (e) {
     res.status(500).json({
       error: "Search failed",
-      detail: String(e)
+      detail: String(e),
     });
   }
 });
@@ -490,7 +518,7 @@ app.get("/search-logs", async (_req, res) => {
   } catch (e) {
     res.status(500).json({
       error: "Failed to fetch logs",
-      detail: String(e)
+      detail: String(e),
     });
   }
 });
