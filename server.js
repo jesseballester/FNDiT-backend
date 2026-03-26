@@ -201,7 +201,28 @@ const LEGO_BLOCK = [
   "instructions",
   "sticker",
   "replacement",
-  "spare"
+  "spare",
+
+  "display case",
+  "display cases",
+  "acrylic case",
+  "acrylic cases",
+  "display box",
+  "display boxes",
+  "storage box",
+  "storage boxes",
+  "dustproof case",
+  "dust proof case",
+  "protective case",
+  "perspex case",
+  "display stand",
+  "display stands",
+  "stand",
+  "stands",
+  "light kit",
+  "lighting kit",
+  "led kit",
+  "led light kit"
 ];
 
 const KIDS_TERMS = [
