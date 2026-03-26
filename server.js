@@ -5,7 +5,6 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 const SERPAPI_KEY = process.env.SERPAPI_KEY;
-const CHECK_SECRET = process.env.CHECK_SECRET || "";
 
 const { Pool } = pg;
 
@@ -30,10 +29,6 @@ function normText(s) {
     .trim();
 }
 
-function uniq(arr) {
-  return Array.from(new Set(arr));
-}
-
 function safeNumber(n) {
   const x = Number(n);
   return Number.isFinite(x) ? x : null;
@@ -56,9 +51,9 @@ async function initDb() {
 }
 
 // =====================
-// Brand Detection
+// Brand detection
 // =====================
-const BRAND_ALIASES = [
+const BRANDS = [
   "nike",
   "adidas",
   "puma",
@@ -68,32 +63,32 @@ const BRAND_ALIASES = [
   "jordan",
   "converse",
   "vans",
-  "lego",
+  "lego"
 ];
 
 function detectBrands(q) {
   const t = normText(q);
-  return BRAND_ALIASES.filter(b => t.includes(b));
+  return BRANDS.filter(b => t.includes(b));
 }
 
 // =====================
-// Implicit Brand Rules
+// Implicit brand logic
 // =====================
-const IMPLICIT_BRANDS = [
+const IMPLICIT = [
   { pattern: /air max|vapormax|pegasus/i, brand: "nike" },
-  { pattern: /samba|gazelle|ultraboost/i, brand: "adidas" },
+  { pattern: /samba|gazelle|ultraboost/i, brand: "adidas" }
 ];
 
-function detectImplicitBrand(q, brands) {
+function detectImplicit(q, brands) {
   if (brands.length) return null;
-  for (const r of IMPLICIT_BRANDS) {
+  for (const r of IMPLICIT) {
     if (r.pattern.test(q)) return r.brand;
   }
   return null;
 }
 
 // =====================
-// LEGO STRICT FILTER
+// LEGO strict filter
 // =====================
 const LEGO_BLOCK = [
   "minifigure",
@@ -104,7 +99,7 @@ const LEGO_BLOCK = [
   "instructions"
 ];
 
-function isLegoSetIntent(q) {
+function isLegoSet(q) {
   const t = normText(q);
   if (!t.includes("lego")) return false;
   if (t.includes("minifig") || t.includes("figure")) return false;
@@ -112,7 +107,7 @@ function isLegoSetIntent(q) {
 }
 
 // =====================
-// Fetch (SerpApi)
+// Fetch Google Shopping
 // =====================
 async function fetchGoogleShopping(q) {
   const url = new URL("https://serpapi.com/search.json");
@@ -125,27 +120,31 @@ async function fetchGoogleShopping(q) {
 
   return (data.shopping_results || [])
     .map(it => ({
-      title: it.title,
-      store: it.source,
+      title: it.title || "Item",
+      store: it.source || "Store",
       price: safeNumber(it.extracted_price),
-      url: it.link
+      currency: "GBP",
+      url: it.link || ""
     }))
     .filter(x => x.price && x.url);
 }
 
 // =====================
-// Search
+// Search logic
 // =====================
 async function runSearch(q) {
   let brands = detectBrands(q);
-  const implicit = detectImplicitBrand(q, brands);
-  if (!brands.length && implicit) brands = [implicit];
+  const implicit = detectImplicit(q, brands);
 
-  const legoMode = isLegoSetIntent(q);
+  if (!brands.length && implicit) {
+    brands = [implicit];
+  }
+
+  const legoMode = isLegoSet(q);
 
   let items = await fetchGoogleShopping(q);
 
-  // LEGO strict filter
+  // LEGO strict mode
   if (legoMode) {
     items = items.filter(i => {
       const t = normText(i.title);
@@ -163,36 +162,55 @@ async function runSearch(q) {
   // Sort by price
   items.sort((a, b) => a.price - b.price);
 
-  const top3 = items.slice(0, 3);
-
-  return { results: top3 };
+  return {
+    results: items.slice(0, 3)
+  };
 }
 
 // =====================
 // Routes
 // =====================
+
+// Health
 app.get("/", (req, res) => {
-  res.json({ ok: true });
+  res.json({ ok: true, service: "fndit-backend" });
 });
 
+// Search
 app.get("/search", async (req, res) => {
-  const q = req.query.q;
-  if (!q) return res.status(400).json({ error: "Missing query" });
+  try {
+    const q = (req.query.q || "").toString().trim();
+    const store = (req.query.store || "Any").toString();
+    const condition = (req.query.condition || "new").toString();
 
-  const out = await runSearch(q);
+    if (!q) {
+      return res.status(400).json({ error: "Missing query" });
+    }
 
-  // ✅ LOG SEARCH
-  await pool.query(
-    `INSERT INTO search_logs (query, results_count) VALUES ($1,$2)`,
-    [q, out.results.length]
-  );
+    const out = await runSearch(q);
 
-  res.json(out);
+    // Log search
+    await pool.query(
+      `INSERT INTO search_logs (query, results_count) VALUES ($1,$2)`,
+      [q, out.results.length]
+    );
+
+    res.json({
+      query: q,
+      store,
+      condition,
+      results: out.results
+    });
+
+  } catch (e) {
+    res.status(500).json({
+      error: "Search failed",
+      detail: String(e)
+    });
+  }
 });
 
-// =====================
-// Search Logs Viewer
-// =====================
+// View logs
 app.get("/search-logs", async (req, res) => {
   const r = await pool.query(`
     SELECT query, results_count, created_at
@@ -208,5 +226,7 @@ app.get("/search-logs", async (req, res) => {
 // Start
 // =====================
 initDb().then(() => {
-  app.listen(PORT, () => console.log("Server running"));
+  app.listen(PORT, () => {
+    console.log(`Server running on ${PORT}`);
+  });
 });
