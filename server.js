@@ -122,9 +122,13 @@ function looksLikeFootwear(q) {
   const t = normText(q);
   return (
     t.includes("air max") ||
+    t.includes("airmax") ||
     t.includes("trainer") ||
+    t.includes("trainers") ||
     t.includes("shoe") ||
+    t.includes("shoes") ||
     t.includes("sneaker") ||
+    t.includes("sneakers") ||
     t.includes("jordan") ||
     t.includes("dunk") ||
     t.includes("samba") ||
@@ -135,7 +139,7 @@ function looksLikeFootwear(q) {
 function isLegoSetIntent(q) {
   const t = normText(q);
   if (!t.includes("lego")) return false;
-  if (t.includes("minifig") || t.includes("figure")) return false;
+  if (t.includes("minifig") || t.includes("minifigure") || t.includes("figure")) return false;
   return true;
 }
 
@@ -143,36 +147,104 @@ function isLegoSetIntent(q) {
 // Filters
 // =====================
 const ACCESSORY_BLOCKLIST = [
-  "case","cover","protector","skin","wrap","grip","holder","stand","mount",
-  "laces","insole","cleaner","spray","sock","bag","replacement","repair"
+  "phone case",
+  "case for",
+  "iphone case",
+  "samsung case",
+  "cover",
+  "screen protector",
+  "tempered glass",
+  "sticker",
+  "skin",
+  "wrap",
+  "grip",
+  "holder",
+  "mount",
+  "keychain",
+  "key ring",
+  "lanyard",
+  "laces",
+  "lace",
+  "insole",
+  "insoles",
+  "shoe cleaner",
+  "cleaner",
+  "protector spray",
+  "spray",
+  "shoe care",
+  "sock",
+  "socks",
+  "replacement",
+  "repair",
+  "hanger",
+  "patch",
+  "iron on",
+  "iron-on",
+  "zipper",
+  "thread"
 ];
 
 const LEGO_BLOCK = [
-  "minifigure","minifig","figure","parts","piece","manual","instructions",
-  "display case","acrylic case","display box","storage box","dustproof case",
-  "stand","display stand","light kit","led kit"
+  "minifigure",
+  "mini figure",
+  "minifig",
+  "minifigs",
+  "figure",
+  "figures",
+  "parts",
+  "piece",
+  "pieces",
+  "manual",
+  "instructions",
+  "display case",
+  "display cases",
+  "acrylic case",
+  "acrylic cases",
+  "display box",
+  "display boxes",
+  "storage box",
+  "storage boxes",
+  "dustproof case",
+  "dust proof case",
+  "protective case",
+  "perspex case",
+  "display stand",
+  "display stands",
+  "light kit",
+  "lighting kit",
+  "led kit",
+  "led light kit"
 ];
 
-const BLOCKED_STORES = ["aliexpress","alibaba"];
+const BLOCKED_STORES = ["aliexpress", "alibaba"];
+
+const KIDS_TERMS = [
+  "kid", "kids", "child", "children", "boy", "boys", "girl", "girls",
+  "infant", "newborn", "toddler", "baby", "babies", "youth", "junior", "jr"
+];
 
 function containsAny(text, phrases) {
   const t = normText(text);
-  return phrases.some(p => t.includes(normText(p)));
+  return phrases.some((p) => t.includes(normText(p)));
 }
 
 function isBlockedStore(store) {
   const s = normText(store);
-  return BLOCKED_STORES.some(b => s.includes(b));
+  return BLOCKED_STORES.some((b) => s.includes(b));
 }
 
 // =====================
 // Query expansion
 // =====================
 function expandQueries(q, brands) {
-  const out = [q];
+  const out = [q.trim()];
 
   const add = (x) => {
-    if (!out.includes(x)) out.push(x);
+    const v = x.trim();
+    if (!v) return;
+    if (!out.some((o) => normalizeQueryKey(o) === normalizeQueryKey(v))) {
+      out.push(v);
+    }
   };
 
   if (looksLikeFootwear(q)) {
@@ -180,12 +252,13 @@ function expandQueries(q, brands) {
     add(`${q} shoes`);
   } else {
     add(`${q} buy`);
+    add(`${q} online`);
   }
 
   if (!brands.length) {
     const t = normText(q);
-    if (t.includes("air max")) add(`Nike ${q}`);
-    if (t.includes("samba")) add(`Adidas ${q}`);
+    if (t.includes("air max") || t.includes("airmax")) add(`Nike ${q}`);
+    if (t.includes("samba") || t.includes("gazelle")) add(`Adidas ${q}`);
   }
 
   return out.slice(0, 3);
@@ -194,25 +267,35 @@ function expandQueries(q, brands) {
 // =====================
 // Fetch
 // =====================
-async function fetchGoogleShopping(q) {
+async function fetchGoogleShopping(q, country = "GB") {
+  if (!SERPAPI_KEY) throw new Error("Missing SERPAPI_KEY");
+
+  const gl = country === "GB" ? "gb" : "us";
   const url = new URL("https://serpapi.com/search.json");
 
   url.searchParams.set("engine", "google_shopping");
   url.searchParams.set("q", q);
+  url.searchParams.set("gl", gl);
+  url.searchParams.set("hl", "en");
   url.searchParams.set("api_key", SERPAPI_KEY);
 
   const r = await fetch(url);
+  if (!r.ok) {
+    const text = await r.text();
+    throw new Error(`SerpApi error: ${r.status} ${text}`);
+  }
+
   const data = await r.json();
 
   return (data.shopping_results || [])
-    .map(it => ({
-      title: it.title,
-      store: it.source,
+    .map((it) => ({
+      title: it.title || "Item",
+      store: it.source || "Store",
       price: safeNumber(it.extracted_price),
       currency: "GBP",
-      url: it.link
+      url: it.product_link || it.link || ""
     }))
-    .filter(x => x.price && x.url);
+    .filter((x) => x.price && x.url);
 }
 
 // =====================
@@ -220,40 +303,65 @@ async function fetchGoogleShopping(q) {
 // =====================
 function scoreResult(item, q, brands, models) {
   const title = normText(item.title);
+  const store = normText(item.store);
+  const qText = normText(q);
   const tokens = tokenize(q);
 
   let score = 0;
 
-  tokens.forEach(t => {
+  // token overlap
+  tokens.forEach((t) => {
     if (title.includes(t)) score += 3;
   });
 
-  brands.forEach(b => {
-    if (title.includes(normText(b))) score += 10;
+  // brand boost
+  brands.forEach((b) => {
+    const bb = normText(b);
+    if (title.includes(bb)) score += 10;
+    else if (store.includes(bb)) score += 5;
   });
 
-  models.forEach(m => {
+  // model boost / penalty
+  models.forEach((m) => {
     if (title.includes(m)) score += 12;
-    else score -= 8;
+    else score -= 6;
   });
+
+  // kids penalty for adult searches
+  const isKids = KIDS_TERMS.some((k) => title.includes(k));
+  if (
+    isKids &&
+    (qText.includes("men") ||
+      qText.includes("mens") ||
+      qText.includes("women") ||
+      qText.includes("womens"))
+  ) {
+    score -= 12;
+  }
+
+  if (title.length < 10) score -= 3;
 
   return score;
 }
 
 function dedupe(items) {
   const seen = new Set();
-  return items.filter(i => {
-    const key = i.url;
-    if (seen.has(key)) return false;
+  const out = [];
+
+  for (const it of items) {
+    const key = (it.url || "").toLowerCase() || `${normText(it.title)}__${it.price}`;
+    if (seen.has(key)) continue;
     seen.add(key);
-    return true;
-  });
+    out.push(it);
+  }
+
+  return out;
 }
 
 // =====================
 // Search logic
 // =====================
-async function runSearch(q) {
+async function runSearch(q, country = "GB") {
   let brands = detectBrands(q);
   const implicit = detectImplicitBrand(q, brands);
 
@@ -263,89 +371,135 @@ async function runSearch(q) {
 
   const models = extractModelNumbers(q);
   const legoMode = isLegoSetIntent(q);
-
   const queries = expandQueries(q, brands);
 
   const batches = await Promise.all(
-    queries.map(q => fetchGoogleShopping(q))
+    queries.map(async (qq) => {
+      try {
+        return await fetchGoogleShopping(qq, country);
+      } catch {
+        return [];
+      }
+    })
   );
 
   let items = dedupe(batches.flat());
 
-  // Block bad stores
-  items = items.filter(i => !isBlockedStore(i.store));
+  // Block low-trust stores
+  items = items.filter((i) => !isBlockedStore(i.store));
 
-  // Remove accessories
-  items = items.filter(i => !containsAny(i.title, ACCESSORY_BLOCKLIST));
+  // Remove general accessories
+  items = items.filter((i) => !containsAny(i.title, ACCESSORY_BLOCKLIST));
 
-  // LEGO strict
+  // LEGO strict mode
   if (legoMode) {
-    items = items.filter(i => !containsAny(i.title, LEGO_BLOCK));
+    items = items.filter((i) => !containsAny(i.title, LEGO_BLOCK));
   }
 
-  // Brand filter
+  // Brand lock first, but allow fallback if it empties everything
+  let brandLocked = items;
   if (brands.length) {
-    items = items.filter(i =>
-      brands.some(b => normText(i.title).includes(b))
+    brandLocked = items.filter((i) =>
+      brands.some((b) => {
+        const bb = normText(b);
+        return normText(i.title).includes(bb) || normText(i.store).includes(bb);
+      })
     );
+    if (brandLocked.length > 0) items = brandLocked;
   }
 
-  // Model filter
+  // Model lock first, but allow fallback if it empties everything
+  let modelLocked = items;
   if (models.length) {
-    items = items.filter(i =>
-      models.some(m => normText(i.title).includes(m))
+    modelLocked = items.filter((i) =>
+      models.some((m) => normText(i.title).includes(m))
     );
+    if (modelLocked.length > 0) items = modelLocked;
   }
 
   // Score + sort
-  items = items
-    .map(i => ({ ...i, score: scoreResult(i, q, brands, models) }))
-    .filter(i => i.score >= 10)
-    .sort((a, b) => b.score - a.score || a.price - b.price);
+  let scored = items
+    .map((i) => ({ ...i, score: scoreResult(i, q, brands, models) }))
+    .sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      return a.price - b.price;
+    });
 
-  return { results: items.slice(0, 3) };
+  // Strict first
+  let filtered = scored.filter((i) => i.score >= (brands.length || models.length ? 12 : 8));
+
+  // ✅ Fallback if too strict
+  if (filtered.length === 0) {
+    filtered = scored.filter((i) => i.score >= 4);
+  }
+
+  return {
+    results: filtered.slice(0, 3).map(({ score, ...rest }) => rest)
+  };
 }
 
 // =====================
 // Routes
 // =====================
-app.get("/", (req, res) => {
-  res.json({ ok: true });
+app.get("/", (_req, res) => {
+  res.json({ ok: true, service: "fndit-backend" });
 });
 
 app.get("/search", async (req, res) => {
-  const q = req.query.q;
-  if (!q) return res.status(400).json({ error: "Missing query" });
+  try {
+    const q = (req.query.q || "").toString().trim();
+    const store = (req.query.store || "Any").toString();
+    const condition = (req.query.condition || "new").toString();
+    const country = (req.query.country || "GB").toString().trim().toUpperCase();
 
-  const out = await runSearch(q);
+    if (!q) {
+      return res.status(400).json({ error: "Missing query" });
+    }
 
-  await pool.query(
-    `INSERT INTO search_logs (query, results_count) VALUES ($1,$2)`,
-    [q, out.results.length]
-  );
+    const out = await runSearch(q, country);
 
-  res.json({
-    query: q,
-    store: "Any",
-    condition: "new",
-    results: out.results
-  });
+    await pool.query(
+      `INSERT INTO search_logs (query, results_count) VALUES ($1,$2)`,
+      [q, out.results.length]
+    );
+
+    res.json({
+      query: q,
+      store,
+      condition,
+      results: out.results
+    });
+  } catch (e) {
+    res.status(500).json({
+      error: "Search failed",
+      detail: String(e)
+    });
+  }
 });
 
-app.get("/search-logs", async (req, res) => {
-  const r = await pool.query(`
-    SELECT query, results_count, created_at
-    FROM search_logs
-    ORDER BY created_at DESC
-    LIMIT 100
-  `);
+app.get("/search-logs", async (_req, res) => {
+  try {
+    const r = await pool.query(`
+      SELECT query, results_count, created_at
+      FROM search_logs
+      ORDER BY created_at DESC
+      LIMIT 100
+    `);
 
-  res.json({ logs: r.rows });
+    res.json({ logs: r.rows });
+  } catch (e) {
+    res.status(500).json({
+      error: "Failed to fetch logs",
+      detail: String(e)
+    });
+  }
 });
 
 // =====================
 // Start
 // =====================
 initDb().then(() => {
-  app.listen(PORT, () => console.log("Server running"));
+  app.listen(PORT, () => {
+    console.log(`Server running on ${PORT}`);
+  });
 });
